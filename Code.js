@@ -25,6 +25,7 @@ const CONFIG = {
   workEndHour: 17,   // 5 PM
   syncDaysAhead: 28, // How many days into the future to sync
   maxHoldHours: 8,   // Skips events that span more than 8 hours (e.g., full workday blocks)
+  holdVisibility: 'private', // Can be 'private', 'public', or 'default'
 };
 
 const HOLD_TITLE = '[DNS] External Appointment';
@@ -197,7 +198,7 @@ function createHold(sourceCalId, sourceEventId, { start, end }) {
     summary: HOLD_TITLE,
     start: { dateTime: start.toISOString() },
     end: { dateTime: end.toISOString() },
-    visibility: 'private',
+    visibility: CONFIG.holdVisibility || 'private',
     transparency: 'opaque',
     reminders: { useDefault: false, overrides: [] },
     extendedProperties: { private: { sourceEventId, sourceCalendarId: sourceCalId } },

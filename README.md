@@ -6,7 +6,7 @@ Protect your time without leaking personal details or dealing with messy third-p
 
 ## Features
 
-* **Privacy First:** Creates opaque `[DNS] External Appointment` holds on your work calendar. Work colleagues only see that you are busy.
+* **Privacy First:** Creates opaque `[DNS] External Appointment` holds on your work calendar. By default, these are set to private so colleagues only see that you are busy (configurable).
 * **Smart Work Hours:** Automatically clamps personal events to fit within your designated work hours (e.g., 9 AM to 5 PM).
 * **Weekend & OOO Detection:** Ignores events on weekends and events that are fully covered by an existing "Out of Office" block on your work calendar.
 * **Duration Limits:** Automatically ignores all-day events or events that span longer than a configurable threshold (defaults to 8 hours).
@@ -24,7 +24,7 @@ Protect your time without leaking personal details or dealing with messy third-p
 1. **Share your Personal Calendar:**
 
    * Go to Google Calendar on your *personal* account.
-   * Go to Settings > Settings for my calendars > [Your Calendar].
+   * Go to Settings > Settings for my calendars > `[Your Calendar]`.
    * Scroll to "Share with specific people or groups", add your work email, and grant permission to "Make changes to events" (or at least "See all event details").
 
 2. **Create the Script:**
@@ -37,7 +37,7 @@ Protect your time without leaking personal details or dealing with messy third-p
 
    * At the top of the script, update the `CONFIG` object.
    * Replace `'your.personal@email.com'` with your actual personal calendar email address(es).
-   * Adjust `workStartHour`, `workEndHour`, and `maxHoldHours` if necessary.
+   * Adjust `workStartHour`, `workEndHour`, `maxHoldHours`, and `holdVisibility` if necessary.
 
 4. **Enable Calendar API:**
 
@@ -48,7 +48,7 @@ Protect your time without leaking personal details or dealing with messy third-p
 
    * In the toolbar at the top of the editor, select the `install` function from the dropdown menu.
    * Click **Run**.
-   * Google will prompt you to review permissions. Click **Review Permissions**, choose your work account, click **Advanced**, and then click Go to [Project Name] (unsafe). Click **Allow**.
+   * Google will prompt you to review permissions. Click **Review Permissions**, choose your work account, click **Advanced**, and then click Go to `[Project Name]` (unsafe). Click **Allow**.
 
 That's it! CalSync will now run automatically in the background every 5 minutes.
 
@@ -60,3 +60,4 @@ If you ever want to stop syncing and remove the generated holds from your work c
 2. Select the `uninstall` function from the top toolbar dropdown.
 3. Click **Run**.
    This will delete the 5-minute trigger and sweep your work calendar to remove any active holds it created.
+   
