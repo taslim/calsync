@@ -33,9 +33,9 @@ const CONFIG = {
   maxHoldHours: 8,   // Holds this long or longer are skipped; a full workday is better expressed as Out of Office
   holdVisibility: 'private', // 'private', 'public', or 'default'
 
-  // Tag each mirrored personal event with the id of its earliest work hold (private property
-  // "workHoldId"), so tools that only see your personal calendar can tell holds from real
-  // conflicts. Needs "Make changes to events" access to the personal calendars.
+  // Tag each mirrored personal event with the id of its earliest work hold in the sync window
+  // (private property "workHoldId"), so tools that only see your personal calendar can tell
+  // holds from real conflicts. Needs "Make changes to events" access to the personal calendars.
   tagPersonalEvents: true,
 };
 
