@@ -35,7 +35,7 @@ test('creates a private, opaque hold clamped to work hours and tags the personal
   assert.equal(hold.visibility, 'private');
   assert.equal(hold.transparency, 'opaque');
   assert.deepEqual(hold.reminders, { useDefault: false, overrides: [] });
-  assert.deepEqual(hold.extendedProperties.private, { calsync: 'hold', sourceEventId: ev.id, sourceCalendarId: PERSONAL });
+  assert.deepEqual(hold.extendedProperties.private, { sourceEventId: ev.id, sourceCalendarId: PERSONAL });
   assert.equal(tagOf(ev), hold.id);
   assert.deepEqual(cs.logs.log, ['CalSync: 1 created, 0 updated, 0 removed']);
 });
@@ -56,6 +56,18 @@ test('skips events that do not block work time, and does not tag them', () => {
   assert.equal(holds().length, 0);
   assert.deepEqual(skipped.map(tagOf), skipped.map(() => null));
   assert.deepEqual(cal.writes(), []);
+});
+
+test('leaves the work calendar\'s own events alone', () => {
+  const { cal, cs, personal, holds } = setup();
+  const meeting = cal.addEvent(WORK, { summary: 'Standup', start: { dateTime: pdt('2026-09-03T10:00') }, end: { dateTime: pdt('2026-09-03T10:30') } });
+  const series = cal.addEvent(WORK, { summary: 'Weekly', recurrence: ['RRULE:FREQ=WEEKLY'], start: { dateTime: pdt('2026-09-03T14:00') }, end: { dateTime: pdt('2026-09-03T15:00') } });
+  personal('2026-09-03T10:00', '2026-09-03T11:00');
+  cs.sync();
+  cs.uninstall();
+  assert.equal(holds().length, 0);
+  assert.deepEqual(cal.live(WORK).map(ev => ev.id), [meeting.id, series.id]);
+  assert.deepEqual(cs.logs.error, []);
 });
 
 test('still holds time for invitations the owner accepted or has not answered', () => {
@@ -215,7 +227,7 @@ test('cleans up duplicate holds left behind by earlier versions', () => {
     cal.addEvent(WORK, {
       summary: cs.HOLD_TITLE, visibility: 'private',
       start: { dateTime: pdt('2026-09-03T10:00') }, end: { dateTime: pdt('2026-09-03T11:00') },
-      extendedProperties: { private: { calsync: 'hold', sourceEventId: ev.id, sourceCalendarId: PERSONAL } },
+      extendedProperties: { private: { sourceEventId: ev.id, sourceCalendarId: PERSONAL } },
     });
   }
   cs.sync();
@@ -228,7 +240,7 @@ test('replaces a hold that was edited into an all-day event', () => {
   const ev = personal('2026-09-03T10:00', '2026-09-03T11:00');
   cal.addEvent(WORK, {
     summary: cs.HOLD_TITLE, visibility: 'private', start: { date: '2026-09-03' }, end: { date: '2026-09-04' },
-    extendedProperties: { private: { calsync: 'hold', sourceEventId: ev.id, sourceCalendarId: PERSONAL } },
+    extendedProperties: { private: { sourceEventId: ev.id, sourceCalendarId: PERSONAL } },
   });
   cs.sync();
   assert.deepEqual(times(), [['2026-09-03T17:00:00.000Z', '2026-09-03T18:00:00.000Z']]);
@@ -306,7 +318,7 @@ test('explains the missing permission when tagging is on and the personal calend
 test('install syncs first and only then schedules the trigger; uninstall removes everything', () => {
   const { cal, cs, personal, holds } = setup();
   personal('2026-09-03T10:00', '2026-09-03T11:00');
-  const oldHold = { // made by an earlier version: no tag, and far outside the sync window
+  const oldHold = { // far outside the sync window
     summary: cs.HOLD_TITLE, start: { dateTime: '2025-01-06T17:00:00Z' }, end: { dateTime: '2025-01-06T18:00:00Z' },
     extendedProperties: { private: { sourceEventId: 'old', sourceCalendarId: PERSONAL } },
   };

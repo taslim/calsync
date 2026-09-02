@@ -40,7 +40,6 @@ const CONFIG = {
 };
 
 const HOLD_TITLE = '[DNS] External Appointment';
-const HOLD_TAG = { key: 'calsync', value: 'hold' }; // Lets every hold be found in one query, whatever CONFIG says now
 const SYNC_INTERVAL_MINUTES = 5; // Apps Script allows 1, 5, 10, 15, or 30
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -61,15 +60,11 @@ function uninstall() {
       if (trigger.getHandlerFunction() === 'sync') ScriptApp.deleteTrigger(trigger);
     }
 
-    const holdIds = new Set();
-    listHolds({}, hold => holdIds.add(hold.id));
-    // Holds from versions before HOLD_TAG existed can only be found through their source calendar.
-    for (const calId of CONFIG.personalCalendarIds) {
-      paginate(CONFIG.workCalendarId, { privateExtendedProperty: `sourceCalendarId=${calId}` }, hold => holdIds.add(hold.id));
-    }
+    const holdIds = [];
+    listHolds({}, hold => holdIds.push(hold.id));
     holdIds.forEach(tryDelete);
 
-    console.log(`CalSync uninstalled: removed ${holdIds.size} holds and the sync trigger`);
+    console.log(`CalSync uninstalled: removed ${holdIds.length} holds and the sync trigger`);
   });
 }
 
@@ -90,10 +85,8 @@ function sync() {
     const holds = new Map();
     const strays = [];
     listHolds(bounds, hold => {
-      const sourceEventId = hold.extendedProperties?.private?.sourceEventId;
-      if (!sourceEventId) return;
       // A duplicate, or a hold someone edited into an all-day event, cannot be kept in step.
-      const key = hold.start.dateTime && holdKey(sourceEventId, hold.start.dateTime, tz);
+      const key = hold.start.dateTime && holdKey(hold.extendedProperties.private.sourceEventId, hold.start.dateTime, tz);
       if (!key || holds.has(key)) strays.push(hold.id);
       else holds.set(key, hold);
     });
@@ -243,16 +236,20 @@ function withLock(fn) {
 }
 
 function paginate(calId, params, fn) {
+  const page = { ...params, maxResults: 2500 }; // The API maximum; the default of 250 pages more often than needed
   let pageToken;
   do {
-    const res = Calendar.Events.list(calId, pageToken ? { ...params, pageToken } : params);
+    const res = Calendar.Events.list(calId, pageToken ? { ...page, pageToken } : page);
     (res.items || []).forEach(fn);
     pageToken = res.nextPageToken;
   } while (pageToken);
 }
 
+/** A hold is any work event naming its personal event; the API cannot filter on that, so this does. */
 function listHolds(params, fn) {
-  paginate(CONFIG.workCalendarId, { ...params, privateExtendedProperty: `${HOLD_TAG.key}=${HOLD_TAG.value}` }, fn);
+  paginate(CONFIG.workCalendarId, params, ev => { // Holds never recur, so series can stay collapsed
+    if (ev.extendedProperties?.private?.sourceEventId) fn(ev);
+  });
 }
 
 function createHold(sourceCalendarId, sourceEventId, range) {
@@ -263,7 +260,7 @@ function createHold(sourceCalendarId, sourceEventId, range) {
     visibility: CONFIG.holdVisibility,
     transparency: 'opaque',
     reminders: { useDefault: false, overrides: [] },
-    extendedProperties: { private: { [HOLD_TAG.key]: HOLD_TAG.value, sourceEventId, sourceCalendarId } },
+    extendedProperties: { private: { sourceEventId, sourceCalendarId } },
   }, CONFIG.workCalendarId).id;
 }
 
