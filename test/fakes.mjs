@@ -70,6 +70,10 @@ export function fakeCalendar({ pageSize = 2 } = {}) {
             // timeMin bounds the END (exclusive), timeMax bounds the START (exclusive), as in the real API.
             if (params.timeMin && !(boundary(ev.end) > Date.parse(params.timeMin))) return false;
             if (params.timeMax && !(boundary(ev.start) < Date.parse(params.timeMax))) return false;
+            if (params.privateExtendedProperty) {
+              const [key, value] = params.privateExtendedProperty.split('=');
+              if (ev.extendedProperties?.private?.[key] !== value) return false;
+            }
             if (params.eventTypes && !params.eventTypes.includes(ev.eventType ?? 'default')) return false;
             return true;
           });

@@ -59,8 +59,11 @@ function uninstall() {
       if (trigger.getHandlerFunction() === 'sync') ScriptApp.deleteTrigger(trigger);
     }
 
+    // Sweeping all time needs the API to do the filtering: a whole calendar is too much to load.
     const holdIds = [];
-    listHolds({}, hold => holdIds.push(hold.id));
+    for (const calId of CONFIG.personalCalendarIds) {
+      paginate(CONFIG.workCalendarId, { privateExtendedProperty: `sourceCalendarId=${calId}` }, hold => holdIds.push(hold.id));
+    }
     holdIds.forEach(tryDelete);
 
     console.log(`CalSync uninstalled: removed ${holdIds.length} holds and the sync trigger`);
@@ -233,16 +236,15 @@ function withLock(fn) {
 }
 
 function paginate(calId, params, fn) {
-  const page = { ...params, maxResults: 2500 }; // The API maximum; the default of 250 pages more often than needed
   let pageToken;
   do {
-    const res = Calendar.Events.list(calId, pageToken ? { ...page, pageToken } : page);
+    const res = Calendar.Events.list(calId, pageToken ? { ...params, pageToken } : params);
     (res.items || []).forEach(fn);
     pageToken = res.nextPageToken;
   } while (pageToken);
 }
 
-/** A hold is any work event naming its personal event; the API cannot filter on that, so this does. */
+/** Holds in a bounded range: any work event naming its personal event. The API cannot filter on that, so this does. */
 function listHolds(params, fn) {
   paginate(CONFIG.workCalendarId, params, ev => { // Holds never recur, so series can stay collapsed
     if (ev.extendedProperties?.private?.sourceEventId) fn(ev);
