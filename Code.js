@@ -40,7 +40,6 @@ const CONFIG = {
 };
 
 const HOLD_TITLE = '[DNS] External Appointment';
-const SYNC_INTERVAL_MINUTES = 5; // Apps Script allows 1, 5, 10, 15, or 30
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
@@ -50,7 +49,7 @@ const DAY_MS = 24 * HOUR_MS;
 function install() {
   uninstall();
   sync(); // Before scheduling, so a misconfiguration fails here instead of every few minutes
-  ScriptApp.newTrigger('sync').timeBased().everyMinutes(SYNC_INTERVAL_MINUTES).create();
+  ScriptApp.newTrigger('sync').timeBased().everyMinutes(5).create(); // Apps Script allows 1, 5, 10, 15, or 30
 }
 
 /** Run from the editor to stop syncing and remove every hold CalSync created. */
@@ -86,7 +85,7 @@ function sync() {
     const strays = [];
     listHolds(bounds, hold => {
       // A duplicate, or a hold someone edited into an all-day event, cannot be kept in step.
-      const key = hold.start.dateTime && holdKey(hold.extendedProperties.private.sourceEventId, hold.start.dateTime, tz);
+      const key = hold.start.dateTime && holdKey(hold.extendedProperties.private.sourceEventId, Date.parse(hold.start.dateTime), tz);
       if (!key || holds.has(key)) strays.push(hold.id);
       else holds.set(key, hold);
     });
@@ -99,11 +98,10 @@ function sync() {
     for (const calId of CONFIG.personalCalendarIds) {
       paginate(calId, { ...bounds, singleEvents: true }, ev => {
         seen.add(ev.id);
-        const needed = blocksTime(ev) ? workRanges(new Date(ev.start.dateTime), new Date(ev.end.dateTime), tz, ooo) : [];
+        const ranges = blocksTime(ev) ? workRanges(Date.parse(ev.start.dateTime), Date.parse(ev.end.dateTime), tz, ooo) : [];
         // Holds outside the window were not indexed above, so touching them would add a
         // duplicate on every run. The event can still overlap the window, e.g. a trip.
-        const inWindow = needed.filter(range => range.end > windowStart && range.start < windowEnd);
-        const holdIds = inWindow.map(range => {
+        const holdIds = ranges.filter(range => range.end > windowStart && range.start < windowEnd).map(range => {
           const key = holdKey(ev.id, range.start, tz);
           wanted.add(key);
           const hold = holds.get(key);
@@ -114,10 +112,7 @@ function sync() {
           if (updateHold(hold, range)) stats.updated++;
           return hold.id;
         });
-        // Holds outside the window cannot be checked, so the tag is only cleared
-        // once the event needs no hold at all.
-        if (holdIds.length) tagPersonalEvent(calId, ev, holdIds[0]);
-        else if (!needed.length) tagPersonalEvent(calId, ev, null);
+        tagPersonalEvent(calId, ev, holdIds[0] ?? null);
       });
     }
 
@@ -144,24 +139,24 @@ function blocksTime(ev) {
 
 /** One hold per personal event and day, so a multi-day event gets a hold on each of its weekdays. */
 function holdKey(sourceEventId, start, tz) {
-  return `${sourceEventId}|${dayOf(new Date(start), tz)}`;
+  return `${sourceEventId}|${dayOf(start, tz)}`;
 }
 
 // ── Work hours ──────────────────────────────────────────────
 
 /**
- * The work-hour ranges of [start, end) that deserve a hold, as one {start, end}
- * in ms per day, in the work calendar's time zone. Weekends, days the event does
- * not reach work hours, holds of maxHoldHours or longer, and holds fully inside
- * an Out of Office block are left out.
+ * The work-hour ranges of [start, end) that deserve a hold, one {start, end} per
+ * day, in the work calendar's time zone. Weekends, days the event does not reach
+ * work hours, holds of maxHoldHours or longer, and holds fully inside an Out of
+ * Office block are left out. All instants are ms since the epoch.
  */
 function workRanges(start, end, tz, ooo) {
   const ranges = [];
   const maxHoldMs = CONFIG.maxHoldHours * HOUR_MS;
-  for (let midnight = midnightInTz(dayOf(start, tz), tz); midnight < end.getTime(); midnight = nextMidnight(midnight, tz)) {
+  for (let midnight = midnightInTz(dayOf(start, tz), tz); midnight < end; midnight = nextMidnight(midnight, tz)) {
     const range = {
-      start: Math.max(start.getTime(), midnight + CONFIG.workStartHour * HOUR_MS),
-      end: Math.min(end.getTime(), midnight + CONFIG.workEndHour * HOUR_MS),
+      start: Math.max(start, midnight + CONFIG.workStartHour * HOUR_MS),
+      end: Math.min(end, midnight + CONFIG.workEndHour * HOUR_MS),
     };
     if (range.start >= range.end || range.end - range.start >= maxHoldMs) continue;
     if (isWeekend(range.start, tz)) continue;
@@ -184,9 +179,9 @@ function getOOORanges(bounds, tz) {
 
 // ── Time zones ──────────────────────────────────────────────
 
-/** Calendar day of `date` in `tz`, as yyyy-MM-dd. */
-function dayOf(date, tz) {
-  return Utilities.formatDate(date, tz, 'yyyy-MM-dd');
+/** Calendar day of instant `ms` in `tz`, as yyyy-MM-dd. */
+function dayOf(ms, tz) {
+  return Utilities.formatDate(new Date(ms), tz, 'yyyy-MM-dd');
 }
 
 function isWeekend(ms, tz) {
@@ -202,7 +197,7 @@ function midnightInTz(dateStr, tz) {
 }
 
 function nextMidnight(midnight, tz) {
-  return midnightInTz(dayOf(new Date(midnight + 36 * HOUR_MS), tz), tz); // 36h lands in the next day whether it has 23, 24, or 25 hours
+  return midnightInTz(dayOf(midnight + 36 * HOUR_MS, tz), tz); // 36h lands in the next day whether it has 23, 24, or 25 hours
 }
 
 /** UTC offset of `tz` at instant `ms`, in ms (e.g. -7 hours for PDT). */

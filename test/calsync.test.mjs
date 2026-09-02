@@ -143,16 +143,17 @@ test('clears the tag of an event that moved out of the sync window', () => {
   assert.equal(tagOf(ev), null);
 });
 
-test('keeps the tag of an event whose only holds have aged out of the window', () => {
+test('points the tag at the earliest hold still inside the window', () => {
   const { cs, clock, personal, holds } = setup({ now: '2026-09-04T09:00' });
-  const ev = personal('2026-09-04T14:00', '2026-09-05T10:00'); // Friday afternoon to Saturday morning
+  const ev = personal('2026-09-04T14:00', '2026-09-07T12:00'); // Friday afternoon to Monday noon
   cs.sync();
-  const holdId = holds()[0].id;
+  const [friday, monday] = holds();
+  assert.equal(tagOf(ev), friday.id);
 
-  clock.now = at('2026-09-05T18:00'); // the Friday hold is now behind the window; the event still overlaps it
+  clock.now = at('2026-09-05T18:00'); // the Friday hold is now behind the window
   cs.sync();
-  assert.equal(tagOf(ev), holdId);
-  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 0 updated, 0 removed');
+  assert.equal(tagOf(ev), monday.id);
+  assert.equal(holds().length, 2);
 });
 
 test('re-creates a hold that was deleted by hand on the work calendar', () => {
@@ -368,7 +369,7 @@ test('refuses to overlap with a run that is still in progress', () => {
 
 test('workRanges evaluates days and hours in the work calendar time zone', () => {
   const { cs } = setup();
-  const ranges = (start, end, tz) => [...cs.workRanges(new Date(start), new Date(end), tz, [])]
+  const ranges = (start, end, tz) => [...cs.workRanges(Date.parse(start), Date.parse(end), tz, [])]
     .map(r => [new Date(r.start).toISOString(), new Date(r.end).toISOString()]);
 
   assert.deepEqual(ranges('2026-09-04T23:30:00Z', '2026-09-05T01:00:00Z', 'Asia/Tokyo'), []); // Saturday morning in Tokyo

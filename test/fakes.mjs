@@ -66,21 +66,17 @@ export function fakeCalendar({ pageSize = 2 } = {}) {
         let cursor = cursors.get(params.pageToken);
         if (!cursor) {
           const items = [...get(calId).events.values()].filter(ev => {
-            if (ev.status === 'cancelled' && !params.showDeleted) return false;
+            if (ev.status === 'cancelled') return false;
             // timeMin bounds the END (exclusive), timeMax bounds the START (exclusive), as in the real API.
             if (params.timeMin && !(boundary(ev.end) > Date.parse(params.timeMin))) return false;
             if (params.timeMax && !(boundary(ev.start) < Date.parse(params.timeMax))) return false;
-            if (params.privateExtendedProperty) {
-              const [key, value] = params.privateExtendedProperty.split('=');
-              if (ev.extendedProperties?.private?.[key] !== value) return false;
-            }
             if (params.eventTypes && !params.eventTypes.includes(ev.eventType ?? 'default')) return false;
             return true;
           });
           cursor = { items, offset: 0 };
         }
         const page = cursor.items.slice(cursor.offset, cursor.offset + pageSize);
-        const res = { items: clone(page.filter(ev => ev.status !== 'cancelled' || params.showDeleted)) };
+        const res = { items: clone(page.filter(ev => ev.status !== 'cancelled')) };
         if (cursor.offset + pageSize < cursor.items.length) {
           res.nextPageToken = `tok${cursors.size + 1}`;
           cursors.set(res.nextPageToken, { items: cursor.items, offset: cursor.offset + pageSize });
