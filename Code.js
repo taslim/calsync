@@ -33,9 +33,9 @@ const CONFIG = {
   maxHoldHours: 8,   // Holds this long or longer are skipped; a full workday is better expressed as Out of Office
   holdVisibility: 'private', // 'private', 'public', or 'default'
 
-  // Tag each mirrored personal event with the id of its work hold (private property
-  // "workHoldId"), so tools that only see your personal calendar can tell holds from
-  // real conflicts. Needs "Make changes to events" access to the personal calendars.
+  // Tag each mirrored personal event with the id of its earliest work hold (private property
+  // "workHoldId"), so tools that only see your personal calendar can tell holds from real
+  // conflicts. Needs "Make changes to events" access to the personal calendars.
   tagPersonalEvents: true,
 };
 
@@ -104,12 +104,14 @@ function sync() {
         const holdIds = ranges.filter(range => range.end > windowStart && range.start < windowEnd).map(range => {
           const key = holdKey(ev.id, range.start, tz);
           wanted.add(key);
-          const hold = holds.get(key);
-          if (!hold) {
+          let hold = holds.get(key);
+          if (hold) {
+            if (updateHold(hold, range)) stats.updated++;
+          } else {
+            hold = createHold(calId, ev.id, range);
+            holds.set(key, hold); // A copy of the same invitation on another personal calendar shares it
             stats.created++;
-            return createHold(calId, ev.id, range);
           }
-          if (updateHold(hold, range)) stats.updated++;
           return hold.id;
         });
         tagPersonalEvent(calId, ev, holdIds[0] ?? null);
@@ -256,7 +258,7 @@ function createHold(sourceCalendarId, sourceEventId, range) {
     transparency: 'opaque',
     reminders: { useDefault: false, overrides: [] },
     extendedProperties: { private: { sourceEventId, sourceCalendarId } },
-  }, CONFIG.workCalendarId).id;
+  }, CONFIG.workCalendarId);
 }
 
 /** Returns whether the hold had to change. */

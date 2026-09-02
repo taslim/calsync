@@ -270,9 +270,9 @@ test('creates a single hold when the same invitation is on two personal calendar
   const copies = [PERSONAL, other].map(calId =>
     cal.addEvent(calId, { id: 'shared-invite', start: { dateTime: pdt('2026-09-03T10:00') }, end: { dateTime: pdt('2026-09-03T11:00') } }));
   cs.sync();
-  cs.sync();
   assert.equal(holds().length, 1);
   assert.deepEqual(copies.map(tagOf), [holds()[0].id, holds()[0].id]);
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 1 created, 0 updated, 0 removed');
 });
 
 test('removes the holds of a calendar taken out of CONFIG', () => {

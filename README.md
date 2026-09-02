@@ -8,7 +8,7 @@ A Google Apps Script that mirrors your personal calendar as `[DNS] External Appo
 - Ignores all-day events, events marked Free, declined invitations, and weekends.
 - Skips holds fully covered by an Out of Office block, and holds that would fill a whole workday (use Out of Office for those).
 - Keeps holds in step with their events: they move, shrink, and disappear as the personal event changes. Runs every 5 minutes and stores nothing outside the two calendars.
-- Tags each mirrored personal event with its hold's id (`workHoldId`, a private extended property), so tools that only see your personal calendar can tell holds from real conflicts. Optional.
+- Tags each mirrored personal event with the id of its earliest hold in the window (`workHoldId`, a private extended property), so tools that only see your personal calendar can tell holds from real conflicts. Optional.
 
 ## Setup
 
