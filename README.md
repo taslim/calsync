@@ -1,63 +1,33 @@
 # CalSync 📅
 
-A lightweight, stateless Google Apps Script that automatically mirrors your personal calendar events as private holds on your work calendar.
+A Google Apps Script that mirrors your personal calendar as `[DNS] External Appointment` holds on your work calendar, so colleagues see that you are busy without seeing why.
 
-Protect your time without leaking personal details or dealing with messy third-party calendar sync tools.
+## What it does
 
-## Features
+- Clamps each personal event to your work hours, in your work calendar's time zone, with one hold per weekday it touches.
+- Ignores all-day events, events marked Free, declined invitations, and weekends.
+- Skips holds fully covered by an Out of Office block, and holds that would fill a whole workday (use Out of Office for those).
+- Keeps holds in step with their events: they move, shrink, and disappear as the personal event changes. Runs every 5 minutes and stores nothing outside the two calendars.
+- Tags each mirrored personal event with the id of its earliest hold in the window (`workHoldId`, a private extended property), so tools that only see your personal calendar can tell holds from real conflicts. Optional.
 
-* **Privacy First:** Creates opaque `[DNS] External Appointment` holds on your work calendar. By default, these are set to private so colleagues only see that you are busy (configurable).
-* **Smart Work Hours:** Automatically clamps personal events to fit within your designated work hours (e.g., 9 AM to 5 PM).
-* **Weekend & OOO Detection:** Ignores events on weekends and events that are fully covered by an existing "Out of Office" block on your work calendar.
-* **Duration Limits:** Automatically ignores all-day events or events that span longer than a configurable threshold (defaults to 8 hours).
-* **Stateless & Resilient:** Uses a rolling 28-day window and private extended properties. It cleans up orphaned holds naturally, ignores infinite recurrences, and safely supports multiple people using CalSync on shared events.
+## Setup
 
-## Prerequisites
+1. On your personal account, share the calendar with your work account: Settings › Settings for my calendars › your calendar › Share with specific people. Permission: **Make changes to events**, or **See all event details** if you turn `tagPersonalEvents` off. Free/busy is not enough.
+2. On your work account, open [script.google.com](https://script.google.com/), create a project, and paste `Code.js` into it.
+3. Edit `CONFIG` at the top: your personal calendar address(es), work hours, and anything else you want changed.
+4. Add the **Google Calendar API** under Services (the `+` in the sidebar).
+5. Run `install` from the function dropdown and grant the permissions it asks for (Advanced › Go to project).
 
-1. A Google Work account (where the script will run).
-2. One or more Personal Google accounts.
-3. Your Personal calendar(s) must be shared with your Work account with **"Make changes to events"** or **"See all event details"** permissions.
-   *(Note: Sharing as "See only free/busy" will not work).*
+Each run logs what it created, updated, and removed under Executions.
 
-## Installation
+## Everyday use
 
-1. **Share your Personal Calendar:**
+- **Change a setting:** edit `CONFIG` and save. The next run applies it to existing holds.
+- **Skip one event:** mark it Free or decline it on your personal calendar. Deleting the hold only brings it back on the next run.
+- **Read the tag:** `workHoldId` is present while the event has a hold within the 28-day window and cleared once it needs none.
+- **Upgrade:** paste the new `Code.js` and run `install` once. It rebuilds the holds.
+- **Stop:** run `uninstall`. It removes the trigger and every hold.
 
-   * Go to Google Calendar on your *personal* account.
-   * Go to Settings > Settings for my calendars > `[Your Calendar]`.
-   * Scroll to "Share with specific people or groups", add your work email, and grant permission to "Make changes to events" (or at least "See all event details").
+## Development
 
-2. **Create the Script:**
-
-   * Log into your *work* account and go to [script.google.com](https://script.google.com/).
-   * Click **New Project**.
-   * Delete any placeholder code and paste the contents of `Code.js` from this repository.
-
-3. **Configure:**
-
-   * At the top of the script, update the `CONFIG` object.
-   * Replace `'your.personal@email.com'` with your actual personal calendar email address(es).
-   * Adjust `workStartHour`, `workEndHour`, `maxHoldHours`, and `holdVisibility` if necessary.
-
-4. **Enable Calendar API:**
-
-   * On the left sidebar of the Apps Script editor, click on **Services** (the `+` icon).
-   * Scroll down, select **Google Calendar API**, and click **Add**.
-
-5. **Run the Setup:**
-
-   * In the toolbar at the top of the editor, select the `install` function from the dropdown menu.
-   * Click **Run**.
-   * Google will prompt you to review permissions. Click **Review Permissions**, choose your work account, click **Advanced**, and then click Go to `[Project Name]` (unsafe). Click **Allow**.
-
-That's it! CalSync will now run automatically in the background every 5 minutes.
-
-## Uninstalling
-
-If you ever want to stop syncing and remove the generated holds from your work calendar:
-
-1. Open your Apps Script project.
-2. Select the `uninstall` function from the top toolbar dropdown.
-3. Click **Run**.
-   This will delete the 5-minute trigger and sweep your work calendar to remove any active holds it created.
-   
+`node --test` runs `Code.js` against in-memory stand-ins for the Calendar API. Node 20 or newer, no dependencies.
