@@ -6,7 +6,7 @@ import vm from 'node:vm';
 const SOURCE = readFileSync(new URL('../Code.js', import.meta.url), 'utf8');
 const ISO_DAY = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
 
-/** Utilities.formatDate for the SimpleDateFormat patterns Code.js relies on. */
+/** Utilities.formatDate for the SimpleDateFormat patterns Code.js and the tests rely on. */
 export function formatDate(date, tz, pattern) {
   const p = Object.fromEntries(
     new Intl.DateTimeFormat('en-US', {
@@ -18,14 +18,25 @@ export function formatDate(date, tz, pattern) {
     case 'u': return String(ISO_DAY[p.weekday]);
     case 'yyyy-MM-dd': return `${p.year}-${p.month}-${p.day}`;
     case 'yyyy-MM-dd HH:mm': return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
-    case 'Z': { // RFC 822 offset, e.g. "-0700"
-      const wallClockAsUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
-      const offsetMin = Math.round((wallClockAsUtc - date.getTime()) / 60000);
-      const abs = Math.abs(offsetMin);
-      return `${offsetMin < 0 ? '-' : '+'}${String(Math.floor(abs / 60)).padStart(2, '0')}${String(abs % 60).padStart(2, '0')}`;
-    }
     default: throw new Error(`formatDate pattern not faked: ${pattern}`);
   }
+}
+
+/** Utilities.parseDate for the one pattern Code.js uses: a calendar day read as local midnight in tz. */
+export function parseDate(text, tz, pattern) {
+  if (pattern !== 'yyyy-MM-dd') throw new Error(`parseDate pattern not faked: ${pattern}`);
+  const utcMidnight = Date.parse(`${text}T00:00:00Z`);
+  // The offset can change between UTC midnight and local midnight (a DST switch), so re-read it at the estimate.
+  const estimate = utcMidnight - offsetMs(utcMidnight, tz);
+  return new Date(utcMidnight - offsetMs(estimate, tz));
+}
+
+function offsetMs(ms, tz) {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      .formatToParts(new Date(ms)).filter(x => x.type !== 'literal').map(x => [x.type, x.value]),
+  );
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - ms;
 }
 
 const clone = x => JSON.parse(JSON.stringify(x));
@@ -67,6 +78,8 @@ export function fakeCalendar({ pageSize = 2 } = {}) {
         if (!cursor) {
           const items = [...get(calId).events.values()].filter(ev => {
             if (ev.status === 'cancelled') return false;
+            // With singleEvents a series appears as its occurrences, otherwise as the series itself.
+            if (params.singleEvents ? ev.recurrence : ev.recurringEventId) return false;
             // timeMin bounds the END (exclusive), timeMax bounds the START (exclusive), as in the real API.
             if (params.timeMin && !(boundary(ev.end) > Date.parse(params.timeMin))) return false;
             if (params.timeMax && !(boundary(ev.start) < Date.parse(params.timeMax))) return false;
@@ -77,6 +90,7 @@ export function fakeCalendar({ pageSize = 2 } = {}) {
             if (params.eventTypes && !params.eventTypes.includes(ev.eventType ?? 'default')) return false;
             return true;
           });
+          if (params.orderBy === 'startTime') items.sort((a, b) => boundary(a.start) - boundary(b.start));
           cursor = { items, offset: 0 };
         }
         const page = cursor.items.slice(cursor.offset, cursor.offset + pageSize);
@@ -86,6 +100,10 @@ export function fakeCalendar({ pageSize = 2 } = {}) {
           cursors.set(res.nextPageToken, { items: cursor.items, offset: cursor.offset + pageSize });
         }
         return res;
+      },
+      get(calId, id) {
+        calls.push('Events.get');
+        return clone(live(get(calId), id));
       },
       insert(resource, calId) {
         calls.push('Events.insert');
@@ -119,7 +137,7 @@ export function fakeCalendar({ pageSize = 2 } = {}) {
     },
     /** Live (not cancelled) events on a calendar. */
     live: calId => [...get(calId).events.values()].filter(ev => ev.status !== 'cancelled'),
-    writes: () => calls.filter(c => c !== 'Events.list' && c !== 'Calendars.get'),
+    writes: () => calls.filter(c => !['Events.list', 'Events.get', 'Calendars.get'].includes(c)),
   };
 }
 
@@ -149,7 +167,7 @@ export function loadCalSync({ calendar, now = () => Date.now(), lockAvailable = 
     error: m => logs.error.push(String(m)),
   };
 
-  const sandbox = { Utilities: { formatDate }, Calendar: calendar.api, ScriptApp, LockService, console, Date: FakeDate };
+  const sandbox = { Utilities: { formatDate, parseDate }, Calendar: calendar.api, ScriptApp, LockService, console, Date: FakeDate };
   const bindings = vm.runInNewContext(
     `${SOURCE}\n;({ CONFIG, HOLD_TITLE, install, uninstall, sync, workRanges, midnightInTz })`,
     sandbox,
