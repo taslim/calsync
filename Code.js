@@ -28,8 +28,8 @@ const CONFIG = {
     'your.personal@email.com', // ⬅️ Replace with your personal calendar email
   ],
 
-  workStartHour: 9,  // 9 AM
-  workEndHour: 17,   // 5 PM
+  workStartHour: 9,
+  workEndHour: 17,
   syncDaysAhead: 28,
   maxHoldHours: 8,   // Holds this long or longer are skipped; a full workday is better expressed as Out of Office
   holdVisibility: 'private', // 'private', 'public', or 'default'
@@ -81,7 +81,6 @@ function sync() {
     const ooo = getOOORanges(bounds, tz);
     const stats = { created: 0, updated: 0, removed: 0 };
 
-    // Existing holds in the window, keyed by the personal event and day they mirror.
     const holds = new Map();
     const strays = [];
     listHolds(bounds, hold => {
@@ -94,7 +93,6 @@ function sync() {
     strays.forEach(tryDelete);
     stats.removed += strays.length;
 
-    // Create or update the holds each personal event needs.
     const wanted = new Set();
     const seen = new Set();
     const tags = new Map(); // One per event or series: patching an occurrence would turn it into an exception
@@ -126,7 +124,6 @@ function sync() {
     }
     for (const tag of tags.values()) tagPersonalEvent(tag);
 
-    // Retire holds nothing needs any more.
     const untag = new Map();
     for (const [key, hold] of holds) {
       if (wanted.has(key)) continue;
@@ -198,7 +195,6 @@ function getOOORanges(bounds, tz) {
 
 // ── Time zones ──────────────────────────────────────────────
 
-/** Calendar day of instant `ms` in `tz`, as yyyy-MM-dd. */
 function dayOf(ms, tz) {
   return Utilities.formatDate(new Date(ms), tz, 'yyyy-MM-dd');
 }
@@ -207,7 +203,6 @@ function isWeekend(ms, tz) {
   return Number(Utilities.formatDate(new Date(ms), tz, 'u')) >= 6; // ISO day of week: 6 = Saturday, 7 = Sunday
 }
 
-/** The instant at which the calendar day `dateStr` (yyyy-MM-dd) starts in `tz`. */
 function midnightInTz(dateStr, tz) {
   return Utilities.parseDate(dateStr, tz, 'yyyy-MM-dd').getTime();
 }
@@ -248,7 +243,7 @@ function paginate(calId, params, fn) {
   } while (pageToken);
 }
 
-/** Holds of the configured calendars, filtered by the API so only holds are ever loaded. */
+/** Filtered by the API per calendar: loading a whole work calendar to pick out the holds ran out of memory. */
 function listHolds(params, fn) {
   for (const calId of CONFIG.personalCalendarIds) {
     paginate(CONFIG.workCalendarId, { ...params, privateExtendedProperty: `sourceCalendarId=${calId}` }, fn);
