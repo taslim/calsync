@@ -11,8 +11,9 @@
  * calendars, so nothing is stored outside the calendars themselves: each hold
  * names the personal event it mirrors in private extended properties, which
  * is what lets holds follow, update, and retire with their event. Optionally,
- * each mirrored personal event is tagged with its hold's id so tools that only
- * see the personal calendar can tell holds from real conflicts.
+ * each mirrored personal event (a recurring one once, on its series) is tagged
+ * with a hold's id so tools that only see the personal calendar can tell holds
+ * from real conflicts.
  */
 
 // ── Configuration ───────────────────────────────────────────
@@ -33,9 +34,9 @@ const CONFIG = {
   maxHoldHours: 8,   // Holds this long or longer are skipped; a full workday is better expressed as Out of Office
   holdVisibility: 'private', // 'private', 'public', or 'default'
 
-  // Tag each mirrored personal event with the id of its earliest work hold in the sync window
-  // (private property "workHoldId"), so tools that only see your personal calendar can tell
-  // holds from real conflicts. Needs "Make changes to events" access to the personal calendars.
+  // Tag each mirrored personal event, or recurring series, with the id of its earliest work hold
+  // in the sync window (private property "workHoldId"), so tools that only see your personal
+  // calendar can tell holds from real conflicts. Needs "Make changes to events" access.
   tagPersonalEvents: true,
 };
 
@@ -52,18 +53,15 @@ function install() {
   ScriptApp.newTrigger('sync').timeBased().everyMinutes(5).create(); // Apps Script allows 1, 5, 10, 15, or 30
 }
 
-/** Run from the editor to stop syncing and remove every hold CalSync created. */
+/** Run from the editor to stop syncing and remove every hold of the configured calendars. */
 function uninstall() {
   withLock(() => {
     for (const trigger of ScriptApp.getProjectTriggers()) {
       if (trigger.getHandlerFunction() === 'sync') ScriptApp.deleteTrigger(trigger);
     }
 
-    // Sweeping all time needs the API to do the filtering: a whole calendar is too much to load.
     const holdIds = [];
-    for (const calId of CONFIG.personalCalendarIds) {
-      paginate(CONFIG.workCalendarId, { privateExtendedProperty: `sourceCalendarId=${calId}` }, hold => holdIds.push(hold.id));
-    }
+    listHolds({}, hold => holdIds.push(hold.id));
     holdIds.forEach(tryDelete);
 
     console.log(`CalSync uninstalled: removed ${holdIds.length} holds and the sync trigger`);
@@ -87,8 +85,9 @@ function sync() {
     const holds = new Map();
     const strays = [];
     listHolds(bounds, hold => {
-      // A duplicate, or a hold someone edited into an all-day event, cannot be kept in step.
-      const key = hold.start.dateTime && holdKey(hold.extendedProperties.private.sourceEventId, Date.parse(hold.start.dateTime), tz);
+      // A duplicate, a hold edited into an all-day event, or one from an older version cannot be kept in step.
+      const uid = hold.extendedProperties.private.sourceUid;
+      const key = uid && hold.start.dateTime && holdKey(uid, Date.parse(hold.start.dateTime), tz);
       if (!key || holds.has(key)) strays.push(hold.id);
       else holds.set(key, hold);
     });
@@ -98,28 +97,34 @@ function sync() {
     // Create or update the holds each personal event needs.
     const wanted = new Set();
     const seen = new Set();
+    const tags = new Map(); // One per event or series: patching an occurrence would turn it into an exception
     for (const calId of CONFIG.personalCalendarIds) {
-      paginate(calId, { ...bounds, singleEvents: true }, ev => {
-        seen.add(ev.id);
+      paginate(calId, { ...bounds, singleEvents: true, orderBy: 'startTime' }, ev => {
+        const eventId = ev.recurringEventId ?? ev.id;
+        seen.add(eventId);
         const ranges = blocksTime(ev) ? workRanges(Date.parse(ev.start.dateTime), Date.parse(ev.end.dateTime), tz, ooo) : [];
         // Holds outside the window were not indexed above, so touching them would add a
         // duplicate on every run. The event can still overlap the window, e.g. a trip.
         const holdIds = ranges.filter(range => range.end > windowStart && range.start < windowEnd).map(range => {
-          const key = holdKey(ev.id, range.start, tz);
+          const key = holdKey(sourceUid(ev), range.start, tz);
           wanted.add(key);
           let hold = holds.get(key);
           if (hold) {
             if (updateHold(hold, range)) stats.updated++;
           } else {
-            hold = createHold(calId, ev.id, range);
-            holds.set(key, hold); // A copy of the same invitation on another personal calendar shares it
+            hold = createHold(calId, ev, range);
+            holds.set(key, hold); // Another copy of the same invitation reuses it
             stats.created++;
           }
           return hold.id;
         });
-        tagPersonalEvent(calId, ev, holdIds[0] ?? null);
+        const tag = tags.get(`${calId}|${eventId}`)
+          ?? { calId, eventId, series: Boolean(ev.recurringEventId), current: ev.extendedProperties?.private?.workHoldId ?? null, holdId: null };
+        tag.holdId = tag.holdId ?? holdIds[0] ?? null; // Occurrences arrive in start order, so the earliest hold wins
+        tags.set(`${calId}|${eventId}`, tag);
       });
     }
+    for (const tag of tags.values()) tagPersonalEvent(tag);
 
     // Retire holds nothing needs any more.
     const untag = new Map();
@@ -142,9 +147,18 @@ function blocksTime(ev) {
   return ev.attendees?.find(a => a.self)?.responseStatus !== 'declined'; // Google Calendar shows declined events as free too
 }
 
+/**
+ * Identity shared by every copy of an event, whichever calendar or system it
+ * arrived through; occurrences of a series are told apart by their original slot.
+ */
+function sourceUid(ev) {
+  const uid = ev.iCalUID ?? ev.id;
+  return ev.originalStartTime ? `${uid}@${Date.parse(ev.originalStartTime.dateTime)}` : uid;
+}
+
 /** One hold per personal event and day, so a multi-day event gets a hold on each of its weekdays. */
-function holdKey(sourceEventId, start, tz) {
-  return `${sourceEventId}|${dayOf(start, tz)}`;
+function holdKey(uid, start, tz) {
+  return `${uid}|${dayOf(start, tz)}`;
 }
 
 // ── Work hours ──────────────────────────────────────────────
@@ -195,21 +209,11 @@ function isWeekend(ms, tz) {
 
 /** The instant at which the calendar day `dateStr` (yyyy-MM-dd) starts in `tz`. */
 function midnightInTz(dateStr, tz) {
-  const utcMidnight = Date.parse(`${dateStr}T00:00:00Z`);
-  // A DST switch between UTC midnight and local midnight changes the offset, so re-read it at the estimate.
-  const estimate = utcMidnight - tzOffsetMs(utcMidnight, tz);
-  return utcMidnight - tzOffsetMs(estimate, tz);
+  return Utilities.parseDate(dateStr, tz, 'yyyy-MM-dd').getTime();
 }
 
 function nextMidnight(midnight, tz) {
   return midnightInTz(dayOf(midnight + 36 * HOUR_MS, tz), tz); // 36h lands in the next day whether it has 23, 24, or 25 hours
-}
-
-/** UTC offset of `tz` at instant `ms`, in ms (e.g. -7 hours for PDT). */
-function tzOffsetMs(ms, tz) {
-  const rfc822 = Utilities.formatDate(new Date(ms), tz, 'Z'); // e.g. "-0700"
-  const sign = rfc822[0] === '-' ? -1 : 1;
-  return sign * (Number(rfc822.slice(1, 3)) * 60 + Number(rfc822.slice(3, 5))) * 60 * 1000;
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -244,14 +248,14 @@ function paginate(calId, params, fn) {
   } while (pageToken);
 }
 
-/** Holds in a bounded range: any work event naming its personal event. The API cannot filter on that, so this does. */
+/** Holds of the configured calendars, filtered by the API so only holds are ever loaded. */
 function listHolds(params, fn) {
-  paginate(CONFIG.workCalendarId, params, ev => { // Holds never recur, so series can stay collapsed
-    if (ev.extendedProperties?.private?.sourceEventId) fn(ev);
-  });
+  for (const calId of CONFIG.personalCalendarIds) {
+    paginate(CONFIG.workCalendarId, { ...params, privateExtendedProperty: `sourceCalendarId=${calId}` }, fn);
+  }
 }
 
-function createHold(sourceCalendarId, sourceEventId, range) {
+function createHold(calId, ev, range) {
   return Calendar.Events.insert({
     summary: HOLD_TITLE,
     start: { dateTime: new Date(range.start).toISOString() },
@@ -259,7 +263,11 @@ function createHold(sourceCalendarId, sourceEventId, range) {
     visibility: CONFIG.holdVisibility,
     transparency: 'opaque',
     reminders: { useDefault: false, overrides: [] },
-    extendedProperties: { private: { sourceEventId, sourceCalendarId } },
+    extendedProperties: { private: {
+      sourceUid: sourceUid(ev),
+      sourceEventId: ev.recurringEventId ?? ev.id, // The event, or series, that carries the tag
+      sourceCalendarId: calId,
+    } },
   }, CONFIG.workCalendarId);
 }
 
@@ -276,12 +284,15 @@ function updateHold(hold, range) {
   return true;
 }
 
-function tagPersonalEvent(calId, ev, holdId) {
-  if (!CONFIG.tagPersonalEvents || (ev.extendedProperties?.private?.workHoldId ?? null) === holdId) return;
+function tagPersonalEvent({ calId, eventId, series, current, holdId }) {
+  if (!CONFIG.tagPersonalEvents) return;
+  // Occurrences can carry stale copies of a series' tag, so read the series itself.
+  if (series) current = Calendar.Events.get(calId, eventId).extendedProperties?.private?.workHoldId ?? null;
+  if (current === holdId) return;
   try {
-    writeTag(calId, ev.id, holdId);
+    writeTag(calId, eventId, holdId);
   } catch (e) {
-    throw new Error(`Could not tag event ${ev.id} on ${calId} (${e.message}). Tagging needs ` +
+    throw new Error(`Could not tag event ${eventId} on ${calId} (${e.message}). Tagging needs ` +
       '"Make changes to events" access to that calendar; grant it or set CONFIG.tagPersonalEvents to false.');
   }
 }
