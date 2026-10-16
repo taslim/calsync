@@ -114,7 +114,19 @@ export function fakeCalendar({ pageSize = 2 } = {}) {
       patch(resource, calId, id) {
         calls.push('Events.patch');
         const ev = live(writable(calId), id);
-        Object.assign(ev, clone(resource));
+        const { extendedProperties, ...fields } = clone(resource);
+        Object.assign(ev, fields);
+        // Calendar merges property maps; null deletes a key without replacing unrelated properties.
+        if (extendedProperties) {
+          ev.extendedProperties ??= {};
+          for (const [scope, props] of Object.entries(extendedProperties)) {
+            const target = ev.extendedProperties[scope] ??= {};
+            for (const [key, value] of Object.entries(props)) {
+              if (value === null) delete target[key];
+              else target[key] = value;
+            }
+          }
+        }
         return clone(ev);
       },
       remove(calId, id) {
