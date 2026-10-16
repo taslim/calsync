@@ -5,7 +5,7 @@ A Google Apps Script that mirrors your personal calendar as `[DNS] External Appo
 ## What it does
 
 - Clamps each personal event to your work hours, in your work calendar's time zone, with one hold per weekday it touches.
-- Ignores all-day events, events marked Free, declined invitations, and weekends.
+- Ignores all-day events, events marked Free, invitations without a Yes response, and weekends.
 - Skips holds fully covered by an Out of Office block, and holds that would fill a whole workday (use Out of Office for those).
 - Keeps holds in step with their events: they move, shrink, and disappear as the personal event changes. Runs every 5 minutes and stores nothing outside the two calendars.
 - Tags each mirrored personal event, or recurring series, with the id of its earliest hold in the window (`workHoldId`, a private extended property), so tools that only see your personal calendar can tell holds from real conflicts. Optional.
@@ -18,16 +18,16 @@ A Google Apps Script that mirrors your personal calendar as `[DNS] External Appo
 4. Add the **Google Calendar API** under Services (the `+` in the sidebar).
 5. Run `install` from the function dropdown and grant the permissions it asks for (Advanced › Go to project).
 
-Each run logs what it created, updated, and removed under Executions.
+Each run logs what it created, updated, and removed under Executions. Tagging failures are logged and retried by scheduled runs without blocking other updates.
 
 ## Everyday use
 
 - **Change a setting:** edit `CONFIG` and save. The next run applies it to existing holds.
-- **Skip one event:** mark it Free or decline it on your personal calendar. Deleting the hold only brings it back on the next run.
+- **Skip one event:** mark it Free, or answer Maybe or No on your personal calendar. Deleting the hold only brings it back on the next run.
 - **Read the tag:** `workHoldId` is present while the event has a hold within the 28-day window and cleared once it needs none. A recurring event carries it on the series, so every occurrence shows it.
 - **Remove a calendar:** run `uninstall`, take it out of `CONFIG`, then run `install`. Holds are looked up by calendar, so its holds would otherwise stay.
-- **Upgrade:** paste the new `Code.js` and run `install` once. It rebuilds the holds.
-- **Stop:** run `uninstall`. It removes the trigger and every hold.
+- **Upgrade:** paste the new `Code.js` and run `install` once. It rebuilds the holds and clears old tags.
+- **Stop:** run `uninstall`. It removes the trigger, holds, and tags. Rerun it if tag cleanup fails.
 
 ## Development
 

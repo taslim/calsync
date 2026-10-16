@@ -80,12 +80,32 @@ test('leaves the work calendar\'s own events alone', () => {
   assert.deepEqual(cs.logs.error, []);
 });
 
-test('still holds time for invitations the owner accepted or has not answered', () => {
+test('only accepted invitations create holds; appointments without an RSVP still do', () => {
   const { cs, personal, holds } = setup();
-  personal('2026-09-03T10:00', '2026-09-03T11:00', { attendees: [{ email: PERSONAL, self: true, responseStatus: 'accepted' }] });
-  personal('2026-09-03T12:00', '2026-09-03T13:00', { attendees: [{ email: PERSONAL, self: true, responseStatus: 'needsAction' }] });
+  const appointment = personal('2026-09-03T09:00', '2026-09-03T10:00');
+  const invites = ['accepted', 'tentative', 'needsAction', 'declined', undefined].map(responseStatus =>
+    personal('2026-09-03T12:00', '2026-09-03T13:00', { attendees: [
+      { email: 'organizer@example.com', responseStatus: 'accepted' },
+      { email: PERSONAL, self: true, responseStatus },
+    ] }));
   cs.sync();
-  assert.equal(holds().length, 2);
+  assert.deepEqual(holds().map(h => h.extendedProperties.private.sourceEventId), [appointment.id, invites[0].id]);
+  assert.deepEqual(invites.slice(1).map(tagOf), [null, null, null, null]);
+});
+
+test('removes existing holds and tags when Yes changes to Maybe, unanswered, or No', () => {
+  const { cs, personal, holds } = setup();
+  const events = ['tentative', 'needsAction', 'declined'].map(() =>
+    personal('2026-09-03T10:00', '2026-09-03T11:00', {
+      attendees: [{ email: PERSONAL, self: true, responseStatus: 'accepted' }],
+    }));
+  cs.sync();
+  assert.equal(holds().length, 3);
+
+  events.forEach((ev, i) => { ev.attendees[0].responseStatus = ['tentative', 'needsAction', 'declined'][i]; });
+  cs.sync();
+  assert.equal(holds().length, 0);
+  assert.deepEqual(events.map(tagOf), [null, null, null]);
 });
 
 test('is idempotent: a second run performs no writes', () => {
@@ -141,6 +161,59 @@ test('removes the hold and the tag when the event is deleted, marked free, or co
   assert.deepEqual(cs.logs.error, []); // clearing the tag of the deleted event fails silently
 });
 
+test('removes deleted and moved event holds even when tagging another event fails', () => {
+  const { cal, cs, personal, holds } = setup();
+  const deleted = personal('2026-09-03T10:00', '2026-09-03T11:00');
+  const moved = personal('2026-09-03T14:00', '2026-09-03T15:00');
+  cs.sync();
+  deleted.status = 'cancelled';
+  moved.start.dateTime = pdt('2026-12-03T14:00');
+  moved.end.dateTime = pdt('2026-12-03T15:00');
+  const added = personal('2026-09-04T10:00', '2026-09-04T11:00');
+  const patch = cal.api.Events.patch;
+  cal.api.Events.patch = (resource, calId, id) => {
+    if (calId === PERSONAL && id === added.id) throw new Error('Forbidden');
+    return patch(resource, calId, id);
+  };
+
+  assert.throws(() => cs.sync(), /Could not tag event.*Make changes to events/);
+  assert.deepEqual(holds().map(h => h.extendedProperties.private.sourceEventId), [added.id]);
+  assert.equal(tagOf(moved), null);
+});
+
+test('removes deleted-event holds even when reading another recurring series fails', () => {
+  const { cal, cs, personal, series, holds } = setup();
+  const deleted = personal('2026-09-03T10:00', '2026-09-03T11:00');
+  cs.sync();
+  deleted.status = 'cancelled';
+  series('yoga', '2026-09-04T12:00', '2026-09-04T13:00', [0, 1]);
+  const get = cal.api.Events.get;
+  cal.api.Events.get = (calId, id) => {
+    if (calId === PERSONAL && id === 'yoga') throw new Error('Not Found');
+    return get(calId, id);
+  };
+
+  assert.throws(() => cs.sync(), /Not Found/);
+  assert.deepEqual(holds().map(h => h.extendedProperties.private.sourceEventId), ['yoga', 'yoga']);
+});
+
+test('removes cancelled recurring occurrences and a deleted series across every page of holds', () => {
+  const { cs, series, holds } = setup();
+  const { master, occurrences } = series('yoga', '2026-09-03T12:00', '2026-09-03T13:00', [0, 1, 2, 3]);
+  cs.sync();
+  const originalHolds = holds().map(h => h.id);
+
+  occurrences[1].status = 'cancelled';
+  cs.sync();
+  assert.deepEqual(holds().map(h => h.id), [originalHolds[0], originalHolds[2], originalHolds[3]]);
+  assert.equal(tagOf(master), originalHolds[0]);
+
+  master.status = 'cancelled';
+  for (const ev of occurrences) ev.status = 'cancelled';
+  cs.sync();
+  assert.equal(holds().length, 0);
+});
+
 test('clears the tag of an event that moved out of the sync window', () => {
   const { cs, personal, holds } = setup();
   const ev = personal('2026-09-03T10:00', '2026-09-03T11:00');
@@ -151,6 +224,137 @@ test('clears the tag of an event that moved out of the sync window', () => {
   ev.end.dateTime = pdt('2026-12-03T11:00');
   cs.sync();
   assert.equal(holds().length, 0);
+  assert.equal(tagOf(ev), null);
+});
+
+test('a failed tag does not starve later tags and is retried without duplicating holds', () => {
+  const { cal, cs, personal, holds } = setup();
+  const first = personal('2026-09-03T10:00', '2026-09-03T11:00');
+  const second = personal('2026-09-04T10:00', '2026-09-04T11:00');
+  const patch = cal.api.Events.patch;
+  cal.api.Events.patch = (resource, calId, id) => {
+    if (calId === PERSONAL && id === first.id) throw new Error('Backend Error');
+    return patch(resource, calId, id);
+  };
+
+  assert.throws(() => cs.sync(), /tagging.*failed/i);
+  assert.equal(holds().length, 2);
+  assert.equal(tagOf(first), null);
+  assert.equal(tagOf(second), holds()[1].id);
+  assert.match(cs.logs.error[0], new RegExp(`${first.id}.*Backend Error`));
+
+  cal.api.Events.patch = patch;
+  cal.calls.length = 0;
+  cs.sync();
+  assert.equal(tagOf(first), holds()[0].id);
+  assert.equal(holds().length, 2);
+  assert.deepEqual(cal.writes(), ['Events.patch']);
+});
+
+test('retries a failed clear after its hold and event have left the sync window', () => {
+  const { cal, cs, clock, personal, holds } = setup();
+  const ev = personal('2026-09-03T10:00', '2026-09-03T11:00');
+  cs.sync();
+  const oldTag = tagOf(ev);
+  ev.start.dateTime = pdt('2026-12-03T10:00');
+  ev.end.dateTime = pdt('2026-12-03T11:00');
+  const patch = cal.api.Events.patch;
+  cal.api.Events.patch = (resource, calId, id) => {
+    if (calId === PERSONAL && id === ev.id) throw new Error('Backend Error');
+    return patch(resource, calId, id);
+  };
+
+  assert.throws(() => cs.sync(), /tagging.*failed/i);
+  assert.equal(holds().length, 0);
+  assert.equal(tagOf(ev), oldTag);
+
+  cal.api.Events.patch = patch;
+  clock.now = at('2026-09-14T12:00');
+  cs.sync();
+  assert.equal(tagOf(ev), null);
+  assert.equal(holds().length, 0);
+  cal.calls.length = 0;
+  cs.sync();
+  assert.deepEqual(cal.writes(), []);
+});
+
+test('a failed tag lookup on one calendar does not block tags on another calendar', () => {
+  const { cal, cs, personal } = setup();
+  const other = 'partner@personal.example';
+  cal.addCalendar(other);
+  cs.CONFIG.personalCalendarIds = [PERSONAL, other];
+  const stale = personal('2026-09-03T10:00', '2026-09-03T11:00');
+  cs.sync();
+  stale.start.dateTime = pdt('2026-12-03T10:00');
+  stale.end.dateTime = pdt('2026-12-03T11:00');
+  const added = cal.addEvent(other, { start: { dateTime: pdt('2026-09-04T10:00') }, end: { dateTime: pdt('2026-09-04T11:00') } });
+  const list = cal.api.Events.list;
+  cal.api.Events.list = (calId, params) => {
+    if (calId === PERSONAL && params.privateExtendedProperty) throw new Error('Backend Error');
+    return list(calId, params);
+  };
+
+  assert.throws(() => cs.sync(), /tagging.*failed/i);
+  assert.notEqual(tagOf(added), null);
+  assert.match(cs.logs.error[0], /Backend Error/);
+  cal.api.Events.list = list;
+  cs.sync();
+  assert.equal(tagOf(stale), null);
+});
+
+test('tag updates preserve unrelated private and shared event properties', () => {
+  const { cs, personal } = setup();
+  const ev = personal('2026-09-03T10:00', '2026-09-03T11:00', {
+    extendedProperties: { private: { otherTool: 'keep' }, shared: { sharedKey: 'keep' } },
+  });
+  cs.sync();
+  assert.notEqual(tagOf(ev), null);
+  assert.equal(ev.extendedProperties.private.otherTool, 'keep');
+  assert.deepEqual(ev.extendedProperties.shared, { sharedKey: 'keep' });
+
+  ev.transparency = 'transparent';
+  cs.sync();
+  assert.deepEqual(ev.extendedProperties, { private: { otherTool: 'keep' }, shared: { sharedKey: 'keep' } });
+});
+
+test('clears legacy tags by calendar as well as event id', () => {
+  const { cal, cs, personal } = setup();
+  const other = 'partner@personal.example';
+  cal.addCalendar(other);
+  cs.CONFIG.personalCalendarIds = [PERSONAL, other];
+  const moved = personal('2026-09-03T10:00', '2026-09-03T11:00', { id: 'same-id', iCalUID: 'first-uid' });
+  const kept = cal.addEvent(other, {
+    id: 'same-id', iCalUID: 'second-uid', start: { dateTime: pdt('2026-09-04T10:00') }, end: { dateTime: pdt('2026-09-04T11:00') },
+  });
+  cs.sync();
+  delete moved.extendedProperties.private.calSyncTagged; // A tag written before the searchable marker.
+  moved.start.dateTime = pdt('2026-12-03T10:00');
+  moved.end.dateTime = pdt('2026-12-03T11:00');
+  cs.sync();
+  assert.equal(tagOf(moved), null);
+  assert.notEqual(tagOf(kept), null);
+});
+
+test('a permission failure clearing a tag is reported and remains retryable', () => {
+  const { cal, cs, personal } = setup();
+  const ev = personal('2026-09-03T10:00', '2026-09-03T11:00');
+  cs.sync();
+  const oldTag = tagOf(ev);
+  ev.start.dateTime = pdt('2026-12-03T10:00');
+  ev.end.dateTime = pdt('2026-12-03T11:00');
+  const patch = cal.api.Events.patch;
+  cal.api.Events.patch = (resource, calId, id) => {
+    if (calId === PERSONAL && id === ev.id) {
+      throw Object.assign(new Error('Resource has been deleted or access is forbidden'), { details: { code: 403 } });
+    }
+    return patch(resource, calId, id);
+  };
+  assert.throws(() => cs.sync(), /tagging.*failed.*Make changes to events/i);
+  assert.equal(tagOf(ev), oldTag);
+  assert.match(cs.logs.error.at(-1), /access is forbidden/);
+
+  cal.api.Events.patch = patch;
+  cs.sync();
   assert.equal(tagOf(ev), null);
 });
 
@@ -394,6 +598,29 @@ test('install syncs first and only then schedules the trigger; uninstall removes
   assert.equal(cs.logs.log.at(-1), 'CalSync uninstalled: removed 2 holds and the sync trigger');
 });
 
+test('install clears legacy tags outside the window; uninstall clears current tags and can be retried', () => {
+  const { cal, cs, personal, holds } = setup();
+  const legacy = personal('2026-12-03T10:00', '2026-12-03T11:00', {
+    extendedProperties: { private: { workHoldId: 'old-hold' } },
+  });
+  const current = personal('2026-09-03T10:00', '2026-09-03T11:00');
+  cs.install();
+  assert.equal(tagOf(legacy), null);
+  assert.notEqual(tagOf(current), null);
+
+  const patch = cal.api.Events.patch;
+  cal.api.Events.patch = (resource, calId, id) => {
+    if (calId === PERSONAL && id === current.id) throw new Error('Backend Error');
+    return patch(resource, calId, id);
+  };
+  assert.throws(() => cs.uninstall(), /tagging.*failed/i);
+  assert.equal(holds().length, 0);
+  assert.equal(cs.triggers.length, 0);
+  cal.api.Events.patch = patch;
+  cs.uninstall();
+  assert.equal(tagOf(current), null);
+});
+
 test('install leaves no trigger behind when the first sync fails', () => {
   const { cs } = setup();
   cs.CONFIG.personalCalendarIds = ['not.shared@personal.example'];
@@ -405,6 +632,7 @@ test('rejects an unedited or inconsistent CONFIG before touching any calendar', 
   const { cal, cs } = setup();
   cs.CONFIG.personalCalendarIds = ['your.personal@email.com'];
   assert.throws(() => cs.sync(), /personalCalendarIds/);
+  assert.throws(() => cs.install(), /personalCalendarIds/);
   cs.CONFIG.personalCalendarIds = [];
   assert.throws(() => cs.sync(), /personalCalendarIds/);
 
@@ -412,6 +640,7 @@ test('rejects an unedited or inconsistent CONFIG before touching any calendar', 
   cs.CONFIG.workStartHour = 17;
   cs.CONFIG.workEndHour = 9;
   assert.throws(() => cs.sync(), /workStartHour/);
+  assert.throws(() => cs.install(), /workStartHour/);
   assert.deepEqual(cal.calls, []);
 });
 

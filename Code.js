@@ -3,7 +3,7 @@
  *
  * Mirrors personal calendar events as "[DNS] External Appointment" holds on
  * your work calendar, clamped to work hours, one hold per weekday an event
- * touches. Skips all-day events, events marked free, declined invitations,
+ * touches. Skips all-day events, events marked free, unaccepted invitations,
  * holds that would fill a whole workday, and holds fully covered by an Out of
  * Office block.
  *
@@ -41,6 +41,7 @@ const CONFIG = {
 };
 
 const HOLD_TITLE = '[DNS] External Appointment';
+const TAG_INDEX = 'calSyncTagged'; // A fixed value makes tags searchable after their holds have gone.
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
@@ -48,12 +49,13 @@ const DAY_MS = 24 * HOUR_MS;
 
 /** Run once from the editor: clears any previous installation, syncs, then schedules the sync. */
 function install() {
+  validateConfig();
   uninstall();
   sync(); // Before scheduling, so a misconfiguration fails here instead of every few minutes
   ScriptApp.newTrigger('sync').timeBased().everyMinutes(5).create(); // Apps Script allows 1, 5, 10, 15, or 30
 }
 
-/** Run from the editor to stop syncing and remove every hold of the configured calendars. */
+/** Run from the editor to stop syncing and remove holds and tags of the configured calendars. */
 function uninstall() {
   withLock(() => {
     for (const trigger of ScriptApp.getProjectTriggers()) {
@@ -63,6 +65,8 @@ function uninstall() {
     const holdIds = [];
     listHolds({}, hold => holdIds.push(hold.id));
     holdIds.forEach(tryDelete);
+    // A manual uninstall/upgrade also finds tags written before the searchable marker existed.
+    reconcileTags(new Map(), true);
 
     console.log(`CalSync uninstalled: removed ${holdIds.length} holds and the sync trigger`);
   });
@@ -94,12 +98,10 @@ function sync() {
     stats.removed += strays.length;
 
     const wanted = new Set();
-    const seen = new Set();
     const tags = new Map(); // One per event or series: patching an occurrence would turn it into an exception
     for (const calId of CONFIG.personalCalendarIds) {
       paginate(calId, { ...bounds, singleEvents: true, orderBy: 'startTime' }, ev => {
         const eventId = ev.recurringEventId ?? ev.id;
-        seen.add(eventId);
         const ranges = blocksTime(ev) ? workRanges(Date.parse(ev.start.dateTime), Date.parse(ev.end.dateTime), tz, ooo) : [];
         // Holds outside the window were not indexed above, so touching them would add a
         // duplicate on every run. The event can still overlap the window, e.g. a trip.
@@ -116,32 +118,35 @@ function sync() {
           }
           return hold.id;
         });
+        const props = ev.extendedProperties?.private;
+        if (!holdIds.length && !props?.workHoldId && !props?.[TAG_INDEX]) return;
         const tag = tags.get(`${calId}|${eventId}`)
-          ?? { calId, eventId, series: Boolean(ev.recurringEventId), current: ev.extendedProperties?.private?.workHoldId ?? null, holdId: null };
+          ?? { calId, eventId, event: ev.recurringEventId ? null : ev, holdId: null };
         tag.holdId = tag.holdId ?? holdIds[0] ?? null; // Occurrences arrive in start order, so the earliest hold wins
         tags.set(`${calId}|${eventId}`, tag);
       });
     }
-    for (const tag of tags.values()) tagPersonalEvent(tag);
-
-    const untag = new Map();
     for (const [key, hold] of holds) {
       if (wanted.has(key)) continue;
       tryDelete(hold.id);
       stats.removed++;
       const { sourceEventId, sourceCalendarId } = hold.extendedProperties.private;
-      // Events that left the window or were deleted were not seen above, so their tags are still set.
-      if (!seen.has(sourceEventId)) untag.set(sourceEventId, sourceCalendarId);
+      const tagKey = `${sourceCalendarId}|${sourceEventId}`;
+      // Also clear legacy tags when their event has left the window.
+      if (sourceEventId && !tags.has(tagKey)) {
+        tags.set(tagKey, { calId: sourceCalendarId, eventId: sourceEventId, holdId: null });
+      }
     }
-    for (const [eventId, calId] of untag) untagQuietly(calId, eventId);
 
     console.log(`CalSync: ${stats.created} created, ${stats.updated} updated, ${stats.removed} removed`);
+    reconcileTags(tags);
   });
 }
 
 function blocksTime(ev) {
   if (!ev.start?.dateTime || ev.status === 'cancelled' || ev.transparency === 'transparent') return false;
-  return ev.attendees?.find(a => a.self)?.responseStatus !== 'declined'; // Google Calendar shows declined events as free too
+  const self = ev.attendees?.find(a => a.self);
+  return !self || self.responseStatus === 'accepted'; // Appointments without an RSVP still block time.
 }
 
 /**
@@ -279,31 +284,57 @@ function updateHold(hold, range) {
   return true;
 }
 
-function tagPersonalEvent({ calId, eventId, series, current, holdId }) {
+// ── Personal event tags ─────────────────────────────────────
+
+function reconcileTags(tags, includeLegacy = false) {
   if (!CONFIG.tagPersonalEvents) return;
-  // Occurrences can carry stale copies of a series' tag, so read the series itself.
-  if (series) current = Calendar.Events.get(calId, eventId).extendedProperties?.private?.workHoldId ?? null;
-  if (current === holdId) return;
-  try {
-    writeTag(calId, eventId, holdId);
-  } catch (e) {
-    throw new Error(`Could not tag event ${eventId} on ${calId} (${e.message}). Tagging needs ` +
-      '"Make changes to events" access to that calendar; grant it or set CONFIG.tagPersonalEvents to false.');
+  const failures = [];
+  const report = message => { failures.push(message); console.error(message); };
+  for (const calId of CONFIG.personalCalendarIds) {
+    try {
+      // No time bounds: a moved event or a failed clear must remain discoverable.
+      paginate(calId, includeLegacy ? {} : { privateExtendedProperty: `${TAG_INDEX}=1` }, ev => {
+        if (ev.recurringEventId) return;
+        const props = ev.extendedProperties?.private;
+        if (!props?.workHoldId && !props?.[TAG_INDEX]) return;
+        const key = `${calId}|${ev.id}`;
+        const tag = tags.get(key) ?? { calId, eventId: ev.id, holdId: null };
+        tag.event = ev; // The series itself, rather than a stale property copied onto an occurrence.
+        tags.set(key, tag);
+      });
+    } catch (e) {
+      report(`Could not list tagged events on ${calId} (${e.message}).`);
+    }
+  }
+
+  for (const tag of tags.values()) {
+    try {
+      tagPersonalEvent(tag);
+    } catch (e) {
+      if (tag.holdId === null && isMissingEvent(e)) continue;
+      report(`Could not tag event ${tag.eventId} on ${tag.calId} (${e.message}).`);
+    }
+  }
+  if (failures.length) {
+    throw new Error(`${failures.length} tagging operation(s) failed. ${failures[0]} See execution logs. ` +
+      'Tagging needs "Make changes to events" access; grant it or set CONFIG.tagPersonalEvents to false.');
   }
 }
 
-/** For events that may no longer exist. */
-function untagQuietly(calId, eventId) {
-  if (!CONFIG.tagPersonalEvents) return;
-  try {
-    writeTag(calId, eventId, null);
-  } catch (e) {
-    // Nothing left to untag.
-  }
+function tagPersonalEvent({ calId, eventId, event, holdId }) {
+  event = event ?? Calendar.Events.get(calId, eventId);
+  if (event.status === 'cancelled') return;
+  const props = event.extendedProperties?.private ?? {};
+  const marker = holdId ? '1' : null;
+  if ((props.workHoldId ?? null) === holdId && (props[TAG_INDEX] ?? null) === marker) return;
+  // Both properties change atomically. A failed clear leaves its searchable marker intact for retry.
+  Calendar.Events.patch({ extendedProperties: { private: { workHoldId: holdId, [TAG_INDEX]: marker } } }, calId, eventId);
 }
 
-function writeTag(calId, eventId, holdId) {
-  Calendar.Events.patch({ extendedProperties: { private: { workHoldId: holdId } } }, calId, eventId);
+function isMissingEvent(error) {
+  const code = error.details?.code;
+  if (code != null) return Number(code) === 404 || Number(code) === 410;
+  return /\b(Not Found|Gone|Resource has been deleted)\b/i.test(error.message);
 }
 
 function tryDelete(holdId) {
