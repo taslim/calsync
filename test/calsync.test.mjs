@@ -4,419 +4,224 @@ import { fakeCalendar, loadCalSync, formatDate } from './fakes.mjs';
 
 const WORK = 'primary';
 const PERSONAL = 'me@personal.example';
+const OTHER = 'partner@personal.example';
+const LA = 'America/Los_Angeles';
 const pdt = s => `${s}:00-07:00`; // Los Angeles wall-clock time in September
 const at = s => Date.parse(pdt(s));
-const tagOf = ev => ev.extendedProperties?.private?.workHoldId ?? null;
+const local = (ms, tz = LA) => formatDate(new Date(ms), tz, 'yyyy-MM-dd HH:mm');
+const invite = responseStatus => ({ attendees: [
+  { email: 'organizer@example.com', organizer: true, responseStatus: 'accepted' },
+  { email: PERSONAL, self: true, responseStatus },
+] });
 
-/** A work calendar plus a personal calendar, with CalSync loaded and pointed at them. */
-function setup({ now = '2026-09-02T12:00', lockAvailable = true, readOnly = false } = {}) {
+/**
+ * A work calendar and a read-only personal calendar, with CalSync loaded and pointed at them.
+ * The personal calendar refuses writes, so every test also checks CalSync only reads it.
+ * The clock starts on Wednesday 2 September 2026 at noon in Los Angeles.
+ */
+function setup({ now = '2026-09-02T12:00', workTimeZone = LA, lockAvailable = true } = {}) {
   const cal = fakeCalendar();
-  cal.addCalendar(WORK);
-  cal.addCalendar(PERSONAL, { readOnly });
+  cal.addCalendar(WORK, { timeZone: workTimeZone });
+  cal.addCalendar(PERSONAL, { readOnly: true });
   const clock = { now: at(now) };
   const cs = loadCalSync({ calendar: cal, now: () => clock.now, lockAvailable });
   cs.CONFIG.personalCalendarIds = [PERSONAL];
-  const personal = (start, end, extra = {}) =>
-    cal.addEvent(PERSONAL, { start: { dateTime: pdt(start) }, end: { dateTime: pdt(end) }, ...extra });
-  /** A weekly series on the personal calendar: the series itself plus its occurrences in the given weeks. */
-  const series = (id, start, end, weeks, extra = {}, calId = PERSONAL) => {
-    const master = cal.addEvent(calId, { id, recurrence: ['RRULE:FREQ=WEEKLY'], start: { dateTime: pdt(start) }, end: { dateTime: pdt(end) }, ...extra });
-    const shift = (s, days) => new Date(at(s) + days * 86400000).toISOString();
-    const occurrences = weeks.map(w => cal.addEvent(calId, {
-      id: `${id}_${w}`, recurringEventId: id, originalStartTime: { dateTime: shift(start, 7 * w) },
-      start: { dateTime: shift(start, 7 * w) }, end: { dateTime: shift(end, 7 * w) }, ...extra,
-    }));
-    return { master, occurrences };
-  };
+  const personal = (start, end, extra = {}, calId = PERSONAL) =>
+    cal.addEvent(calId, { start: { dateTime: pdt(start) }, end: { dateTime: pdt(end) }, ...extra });
   const holds = () => cal.live(WORK)
-    .filter(ev => ev.summary === cs.HOLD_TITLE)
+    .filter(ev => ev.id.startsWith('csdnshold'))
     .sort((a, b) => Date.parse(a.start.dateTime) - Date.parse(b.start.dateTime));
-  const times = () => holds().map(h => [h.start.dateTime, h.end.dateTime].map(t => new Date(t).toISOString()));
-  return { cal, cs, clock, personal, series, holds, times };
+  /** Each hold as [start, end] on the work calendar's wall clock. */
+  const times = () => holds().map(h => [h.start, h.end].map(t => local(Date.parse(t.dateTime), workTimeZone)));
+  return { cal, cs, clock, personal, holds, times };
 }
 
-test('creates a private, opaque hold clamped to work hours and tags the personal event with it', () => {
+// ── What gets a hold ────────────────────────────────────────
+
+test('mirrors a personal event as a private, busy hold on its work-hour part', () => {
   const { cs, personal, holds, times } = setup();
-  const ev = personal('2026-09-03T08:30', '2026-09-03T10:15', { iCalUID: 'abc@google.com' });
+  personal('2026-09-03T08:30', '2026-09-03T10:15');
   cs.sync();
 
-  assert.deepEqual(times(), [['2026-09-03T16:00:00.000Z', '2026-09-03T17:15:00.000Z']]);
+  assert.deepEqual(times(), [['2026-09-03 09:00', '2026-09-03 10:15']]);
   const [hold] = holds();
+  assert.match(hold.id, /^csdnshold[0-9a-f]{32}$/);
+  assert.equal(hold.summary, '[DNS] External Appointment');
   assert.equal(hold.visibility, 'private');
   assert.equal(hold.transparency, 'opaque');
   assert.deepEqual(hold.reminders, { useDefault: false, overrides: [] });
-  assert.deepEqual(hold.extendedProperties.private, { sourceUid: 'abc@google.com', sourceEventId: ev.id, sourceCalendarId: PERSONAL });
-  assert.equal(tagOf(ev), hold.id);
-  assert.deepEqual(cs.logs.log, ['CalSync: 1 created, 0 updated, 0 removed']);
+  assert.equal(hold.extendedProperties, undefined);
+  assert.deepEqual(cs.logs.log, ['CalSync: 1 created, 0 removed']);
 });
 
-test('skips events that do not block work time, and does not tag them', () => {
-  const { cs, cal, personal, holds } = setup();
-  const skipped = [
-    cal.addEvent(PERSONAL, { start: { date: '2026-09-03' }, end: { date: '2026-09-04' } }), // all-day
-    personal('2026-09-03T10:00', '2026-09-03T11:00', { transparency: 'transparent' }), // marked free
-    personal('2026-09-03T10:00', '2026-09-03T11:00', { status: 'cancelled' }),
-    personal('2026-09-03T10:00', '2026-09-03T11:00', { attendees: [{ email: PERSONAL, self: true, responseStatus: 'declined' }] }),
-    personal('2026-09-05T10:00', '2026-09-05T11:00'), // Saturday
-    personal('2026-09-03T18:00', '2026-09-03T19:00'), // after work
-    personal('2026-09-03T07:00', '2026-09-03T09:00'), // ends as work starts
-    personal('2026-09-03T09:00', '2026-09-03T17:00'), // fills the whole workday
-  ];
+test('skips all-day events, events marked free, weekends, time outside work hours, and full workdays', () => {
+  const { cal, cs, personal, holds } = setup();
+  cal.addEvent(PERSONAL, { start: { date: '2026-09-03' }, end: { date: '2026-09-04' } });
+  personal('2026-09-03T10:00', '2026-09-03T11:00', { transparency: 'transparent' });
+  personal('2026-09-05T10:00', '2026-09-05T11:00'); // Saturday
+  personal('2026-09-03T18:00', '2026-09-03T19:00');
+  personal('2026-09-03T07:00', '2026-09-03T09:00'); // ends as work starts
+  personal('2026-09-03T09:00', '2026-09-03T17:00'); // Out of Office says this better
   cs.sync();
   assert.equal(holds().length, 0);
-  assert.deepEqual(skipped.map(tagOf), skipped.map(() => null));
   assert.deepEqual(cal.writes(), []);
 });
 
-test('leaves the work calendar\'s own events alone', () => {
-  const { cal, cs, personal, holds } = setup();
-  const meeting = cal.addEvent(WORK, { summary: 'Standup', start: { dateTime: pdt('2026-09-03T10:00') }, end: { dateTime: pdt('2026-09-03T10:30') } });
-  const weekly = cal.addEvent(WORK, { summary: 'Weekly', recurrence: ['RRULE:FREQ=WEEKLY'], start: { dateTime: pdt('2026-09-03T14:00') }, end: { dateTime: pdt('2026-09-03T15:00') } });
+test('mirrors appointments and accepted invitations, not tentative, unanswered, or declined ones', () => {
+  const { cs, personal, times } = setup();
+  personal('2026-09-03T09:00', '2026-09-03T10:00');
+  personal('2026-09-03T11:00', '2026-09-03T12:00', invite('accepted'));
+  for (const response of ['tentative', 'needsAction', 'declined', undefined]) {
+    personal('2026-09-03T14:00', '2026-09-03T15:00', invite(response));
+  }
+  cs.sync();
+  assert.deepEqual(times(), [['2026-09-03 09:00', '2026-09-03 10:00'], ['2026-09-03 11:00', '2026-09-03 12:00']]);
+});
+
+test('holds each weekday of a multi-day event', () => {
+  const { cs, personal, times } = setup();
+  personal('2026-09-07T15:00', '2026-09-09T11:00'); // Monday afternoon to Wednesday morning
+  personal('2026-09-13T22:00', '2026-09-14T10:00'); // Sunday night to Monday morning
+  cs.sync();
+  assert.deepEqual(times(), [
+    ['2026-09-07 15:00', '2026-09-07 17:00'],
+    ['2026-09-09 09:00', '2026-09-09 11:00'], // Tuesday would be a full workday
+    ['2026-09-14 09:00', '2026-09-14 10:00'],
+  ]);
+});
+
+test('skips holds inside Out of Office, timed or all-day, and keeps partly covered ones', () => {
+  const { cal, cs, personal, times } = setup();
+  cal.addEvent(WORK, { eventType: 'outOfOffice', start: { dateTime: pdt('2026-09-03T09:00') }, end: { dateTime: pdt('2026-09-03T12:00') } });
+  cal.addEvent(WORK, { eventType: 'outOfOffice', start: { date: '2026-09-04' }, end: { date: '2026-09-05' } });
   personal('2026-09-03T10:00', '2026-09-03T11:00');
+  personal('2026-09-04T10:00', '2026-09-04T11:00');
+  personal('2026-09-03T11:30', '2026-09-03T13:00'); // runs past the end of the timed block
   cs.sync();
-  cs.uninstall();
-  assert.equal(holds().length, 0);
-  assert.deepEqual(cal.live(WORK).map(ev => ev.id), [meeting.id, weekly.id]);
-  assert.deepEqual(cs.logs.error, []);
+  assert.deepEqual(times(), [['2026-09-03 11:30', '2026-09-03 13:00']]);
 });
 
-test('only accepted invitations create holds; appointments without an RSVP still do', () => {
-  const { cs, personal, holds } = setup();
-  const appointment = personal('2026-09-03T09:00', '2026-09-03T10:00');
-  const invites = ['accepted', 'tentative', 'needsAction', 'declined', undefined].map(responseStatus =>
-    personal('2026-09-03T12:00', '2026-09-03T13:00', { attendees: [
-      { email: 'organizer@example.com', responseStatus: 'accepted' },
-      { email: PERSONAL, self: true, responseStatus },
-    ] }));
+test('gives busy time one hold, however many events or calendars it comes from', () => {
+  const { cal, cs, personal, times } = setup();
+  cal.addCalendar(OTHER, { readOnly: true });
+  cs.CONFIG.personalCalendarIds = [PERSONAL, OTHER];
+  const copies = [PERSONAL, OTHER].map(calId => personal('2026-09-03T10:00', '2026-09-03T11:00', { iCalUID: 'shared@google.com' }, calId));
+  personal('2026-09-03T10:00', '2026-09-03T11:00'); // a different event at the same time
+  personal('2026-09-03T10:30', '2026-09-03T11:30'); // overlapping time is its own hold
   cs.sync();
-  assert.deepEqual(holds().map(h => h.extendedProperties.private.sourceEventId), [appointment.id, invites[0].id]);
-  assert.deepEqual(invites.slice(1).map(tagOf), [null, null, null, null]);
+  assert.deepEqual(times(), [['2026-09-03 10:00', '2026-09-03 11:00'], ['2026-09-03 10:30', '2026-09-03 11:30']]);
+
+  for (const copy of copies) copy.status = 'cancelled';
+  cs.sync();
+  assert.equal(times().length, 2);
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 0 removed');
 });
 
-test('removes existing holds and tags when Yes changes to Maybe, unanswered, or No', () => {
-  const { cs, personal, holds } = setup();
-  const events = ['tentative', 'needsAction', 'declined'].map(() =>
-    personal('2026-09-03T10:00', '2026-09-03T11:00', {
-      attendees: [{ email: PERSONAL, self: true, responseStatus: 'accepted' }],
-    }));
-  cs.sync();
-  assert.equal(holds().length, 3);
+// ── Time zones ──────────────────────────────────────────────
 
-  events.forEach((ev, i) => { ev.attendees[0].responseStatus = ['tentative', 'needsAction', 'declined'][i]; });
-  cs.sync();
-  assert.equal(holds().length, 0);
-  assert.deepEqual(events.map(tagOf), [null, null, null]);
+test('reads work hours and weekends on the work calendar\'s clock', () => {
+  const { cs } = setup();
+  const parts = (start, end, tz) => [...cs.workHours(Date.parse(start), Date.parse(end), tz)].map(p => [local(p.start, tz), local(p.end, tz)]);
+
+  assert.deepEqual(parts('2026-09-04T23:30:00Z', '2026-09-05T01:00:00Z', 'Asia/Tokyo'), []); // Saturday morning in Tokyo
+  assert.deepEqual(parts('2026-09-05T02:00:00Z', '2026-09-05T03:00:00Z', LA), []); // Friday evening in Los Angeles
+  assert.deepEqual(parts('2026-09-04T00:30:00Z', '2026-09-04T02:00:00Z', 'Asia/Tokyo'), [['2026-09-04 09:30', '2026-09-04 11:00']]);
+  assert.deepEqual(parts('2026-09-04T00:30:00Z', '2026-09-06T02:00:00Z', 'Asia/Kolkata'), // Friday 06:00 to Sunday 07:30
+    [['2026-09-04 09:00', '2026-09-04 17:00']]);
 });
 
-test('is idempotent: a second run performs no writes', () => {
-  const { cal, cs, personal, series } = setup();
+test('keeps work hours on the wall clock on a weekday the clocks change', () => {
+  const { cs } = setup();
+  const tz = 'Asia/Jerusalem'; // Clocks go forward at 02:00 on Friday 27 March 2026
+  const [part] = cs.workHours(Date.parse('2026-03-27T05:00:00Z'), Date.parse('2026-03-27T09:00:00Z'), tz); // 08:00–12:00 local
+  assert.deepEqual([local(part.start, tz), local(part.end, tz)], ['2026-03-27 09:00', '2026-03-27 12:00']);
+});
+
+test('places holds on the work calendar\'s clock, whatever zone the personal event uses', () => {
+  const { cs, personal, times } = setup({ workTimeZone: 'Europe/London' });
+  personal('2026-09-03T00:00', '2026-09-03T02:00'); // 08:00–10:00 in London
+  cs.sync();
+  assert.deepEqual(times(), [['2026-09-03 09:00', '2026-09-03 10:00']]);
+});
+
+// ── Keeping holds in step ───────────────────────────────────
+
+test('a second run changes nothing', () => {
+  const { cal, cs, personal } = setup();
   personal('2026-09-03T10:00', '2026-09-03T11:00');
-  series('yoga', '2026-09-03T12:00', '2026-09-03T13:00', [0, 1, 2]);
+  personal('2026-09-07T15:00', '2026-09-09T11:00');
+  cal.addEvent(PERSONAL, { id: 'yoga', recurrence: ['RRULE:FREQ=WEEKLY'], start: { dateTime: pdt('2026-09-03T12:00') }, end: { dateTime: pdt('2026-09-03T13:00') } });
+  personal('2026-09-03T12:00', '2026-09-03T13:00', { recurringEventId: 'yoga' });
   cs.sync();
+
   cal.calls.length = 0;
   cs.sync();
   assert.deepEqual(cal.writes(), []);
-  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 0 updated, 0 removed');
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 0 removed');
 });
 
-test('moves the hold when the personal event moves, and keeps the tag pointing at it', () => {
+test('replaces a hold when its event moves', () => {
   const { cs, personal, holds, times } = setup();
   const ev = personal('2026-09-03T10:00', '2026-09-03T11:00');
   cs.sync();
-  const holdId = holds()[0].id;
+  const before = holds()[0].id;
 
-  ev.start.dateTime = pdt('2026-09-03T13:00'); // later the same day: the hold is patched in place
-  ev.end.dateTime = pdt('2026-09-03T19:00');
+  ev.start.dateTime = pdt('2026-09-03T13:00');
+  ev.end.dateTime = pdt('2026-09-03T14:00');
   cs.sync();
-  assert.deepEqual(times(), [['2026-09-03T20:00:00.000Z', '2026-09-04T00:00:00.000Z']]);
-  assert.equal(holds()[0].id, holdId);
-  assert.equal(tagOf(ev), holdId);
-  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 1 updated, 0 removed');
-
-  ev.start.dateTime = pdt('2026-09-04T10:00'); // another day: the old hold goes, a new one comes
-  ev.end.dateTime = pdt('2026-09-04T11:00');
-  cs.sync();
-  assert.deepEqual(times(), [['2026-09-04T17:00:00.000Z', '2026-09-04T18:00:00.000Z']]);
-  assert.notEqual(holds()[0].id, holdId);
-  assert.equal(tagOf(ev), holds()[0].id);
-  assert.equal(cs.logs.log.at(-1), 'CalSync: 1 created, 0 updated, 1 removed');
+  assert.deepEqual(times(), [['2026-09-03 13:00', '2026-09-03 14:00']]);
+  assert.notEqual(holds()[0].id, before);
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 1 created, 1 removed');
 });
 
-test('removes the hold and the tag when the event is deleted, marked free, or covered by Out of Office', () => {
+test('removes holds whose events are deleted, declined, marked free, or covered by Out of Office', () => {
   const { cal, cs, personal, holds } = setup();
   const deleted = personal('2026-09-03T10:00', '2026-09-03T11:00');
+  const declined = personal('2026-09-03T13:00', '2026-09-03T14:00', invite('accepted'));
   const freed = personal('2026-09-04T10:00', '2026-09-04T11:00');
-  const covered = personal('2026-09-07T10:00', '2026-09-07T11:00');
+  personal('2026-09-07T10:00', '2026-09-07T11:00');
   cs.sync();
-  assert.equal(holds().length, 3);
+  assert.equal(holds().length, 4);
 
   deleted.status = 'cancelled';
+  declined.attendees[1].responseStatus = 'declined';
   freed.transparency = 'transparent';
   cal.addEvent(WORK, { eventType: 'outOfOffice', start: { date: '2026-09-07' }, end: { date: '2026-09-08' } });
   cs.sync();
   assert.equal(holds().length, 0);
-  assert.equal(tagOf(freed), null);
-  assert.equal(tagOf(covered), null);
-  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 0 updated, 3 removed');
-  assert.deepEqual(cs.logs.error, []); // clearing the tag of the deleted event fails silently
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 4 removed');
 });
 
-test('removes deleted and moved event holds even when tagging another event fails', () => {
-  const { cal, cs, personal, holds } = setup();
-  const deleted = personal('2026-09-03T10:00', '2026-09-03T11:00');
-  const moved = personal('2026-09-03T14:00', '2026-09-03T15:00');
+test('follows each occurrence of a recurring event', () => {
+  const { cal, cs, personal, times } = setup();
+  cal.addEvent(PERSONAL, { id: 'yoga', recurrence: ['RRULE:FREQ=WEEKLY'], start: { dateTime: pdt('2026-09-03T12:00') }, end: { dateTime: pdt('2026-09-03T13:00') } });
+  const [, cancelled, moved] = ['03', '10', '17'].map(day => personal(`2026-09-${day}T12:00`, `2026-09-${day}T13:00`, { recurringEventId: 'yoga' }));
   cs.sync();
-  deleted.status = 'cancelled';
-  moved.start.dateTime = pdt('2026-12-03T14:00');
-  moved.end.dateTime = pdt('2026-12-03T15:00');
-  const added = personal('2026-09-04T10:00', '2026-09-04T11:00');
-  const patch = cal.api.Events.patch;
-  cal.api.Events.patch = (resource, calId, id) => {
-    if (calId === PERSONAL && id === added.id) throw new Error('Forbidden');
-    return patch(resource, calId, id);
-  };
+  assert.equal(times().length, 3);
 
-  assert.throws(() => cs.sync(), /Could not tag event.*Make changes to events/);
-  assert.deepEqual(holds().map(h => h.extendedProperties.private.sourceEventId), [added.id]);
-  assert.equal(tagOf(moved), null);
+  cancelled.status = 'cancelled';
+  moved.start.dateTime = pdt('2026-09-18T12:00');
+  moved.end.dateTime = pdt('2026-09-18T13:00');
+  cs.sync();
+  assert.deepEqual(times(), [['2026-09-03 12:00', '2026-09-03 13:00'], ['2026-09-18 12:00', '2026-09-18 13:00']]);
 });
 
-test('removes deleted-event holds even when reading another recurring series fails', () => {
-  const { cal, cs, personal, series, holds } = setup();
-  const deleted = personal('2026-09-03T10:00', '2026-09-03T11:00');
+test('undoes hand edits: a hold deleted, moved, made all-day, or copied', () => {
+  const { cal, cs, personal, holds, times } = setup();
+  for (const day of ['03', '04', '08', '09']) personal(`2026-09-${day}T10:00`, `2026-09-${day}T11:00`);
   cs.sync();
-  deleted.status = 'cancelled';
-  series('yoga', '2026-09-04T12:00', '2026-09-04T13:00', [0, 1]);
-  const get = cal.api.Events.get;
-  cal.api.Events.get = (calId, id) => {
-    if (calId === PERSONAL && id === 'yoga') throw new Error('Not Found');
-    return get(calId, id);
-  };
+  const expected = times();
+  const [deleted, moved, allDay, copied] = holds();
 
-  assert.throws(() => cs.sync(), /Not Found/);
-  assert.deepEqual(holds().map(h => h.extendedProperties.private.sourceEventId), ['yoga', 'yoga']);
-});
-
-test('removes cancelled recurring occurrences and a deleted series across every page of holds', () => {
-  const { cs, series, holds } = setup();
-  const { master, occurrences } = series('yoga', '2026-09-03T12:00', '2026-09-03T13:00', [0, 1, 2, 3]);
+  cal.api.Events.remove(WORK, deleted.id);
+  moved.start = { dateTime: pdt('2026-09-04T12:00') };
+  moved.end = { dateTime: pdt('2026-09-04T13:00') };
+  allDay.start = { date: '2026-09-08' };
+  allDay.end = { date: '2026-09-09' };
+  cal.addEvent(WORK, { ...JSON.parse(JSON.stringify(copied)), id: 'csdnshold0duplicate' });
   cs.sync();
-  const originalHolds = holds().map(h => h.id);
-
-  occurrences[1].status = 'cancelled';
-  cs.sync();
-  assert.deepEqual(holds().map(h => h.id), [originalHolds[0], originalHolds[2], originalHolds[3]]);
-  assert.equal(tagOf(master), originalHolds[0]);
-
-  master.status = 'cancelled';
-  for (const ev of occurrences) ev.status = 'cancelled';
-  cs.sync();
-  assert.equal(holds().length, 0);
-});
-
-test('clears the tag of an event that moved out of the sync window', () => {
-  const { cs, personal, holds } = setup();
-  const ev = personal('2026-09-03T10:00', '2026-09-03T11:00');
-  cs.sync();
-  assert.notEqual(tagOf(ev), null);
-
-  ev.start.dateTime = pdt('2026-12-03T10:00');
-  ev.end.dateTime = pdt('2026-12-03T11:00');
-  cs.sync();
-  assert.equal(holds().length, 0);
-  assert.equal(tagOf(ev), null);
-});
-
-test('a failed tag does not starve later tags and is retried without duplicating holds', () => {
-  const { cal, cs, personal, holds } = setup();
-  const first = personal('2026-09-03T10:00', '2026-09-03T11:00');
-  const second = personal('2026-09-04T10:00', '2026-09-04T11:00');
-  const patch = cal.api.Events.patch;
-  cal.api.Events.patch = (resource, calId, id) => {
-    if (calId === PERSONAL && id === first.id) throw new Error('Backend Error');
-    return patch(resource, calId, id);
-  };
-
-  assert.throws(() => cs.sync(), /tagging.*failed/i);
-  assert.equal(holds().length, 2);
-  assert.equal(tagOf(first), null);
-  assert.equal(tagOf(second), holds()[1].id);
-  assert.match(cs.logs.error[0], new RegExp(`${first.id}.*Backend Error`));
-
-  cal.api.Events.patch = patch;
-  cal.calls.length = 0;
-  cs.sync();
-  assert.equal(tagOf(first), holds()[0].id);
-  assert.equal(holds().length, 2);
-  assert.deepEqual(cal.writes(), ['Events.patch']);
-});
-
-test('retries a failed clear after its hold and event have left the sync window', () => {
-  const { cal, cs, clock, personal, holds } = setup();
-  const ev = personal('2026-09-03T10:00', '2026-09-03T11:00');
-  cs.sync();
-  const oldTag = tagOf(ev);
-  ev.start.dateTime = pdt('2026-12-03T10:00');
-  ev.end.dateTime = pdt('2026-12-03T11:00');
-  const patch = cal.api.Events.patch;
-  cal.api.Events.patch = (resource, calId, id) => {
-    if (calId === PERSONAL && id === ev.id) throw new Error('Backend Error');
-    return patch(resource, calId, id);
-  };
-
-  assert.throws(() => cs.sync(), /tagging.*failed/i);
-  assert.equal(holds().length, 0);
-  assert.equal(tagOf(ev), oldTag);
-
-  cal.api.Events.patch = patch;
-  clock.now = at('2026-09-14T12:00');
-  cs.sync();
-  assert.equal(tagOf(ev), null);
-  assert.equal(holds().length, 0);
-  cal.calls.length = 0;
-  cs.sync();
-  assert.deepEqual(cal.writes(), []);
-});
-
-test('a failed tag lookup on one calendar does not block tags on another calendar', () => {
-  const { cal, cs, personal } = setup();
-  const other = 'partner@personal.example';
-  cal.addCalendar(other);
-  cs.CONFIG.personalCalendarIds = [PERSONAL, other];
-  const stale = personal('2026-09-03T10:00', '2026-09-03T11:00');
-  cs.sync();
-  stale.start.dateTime = pdt('2026-12-03T10:00');
-  stale.end.dateTime = pdt('2026-12-03T11:00');
-  const added = cal.addEvent(other, { start: { dateTime: pdt('2026-09-04T10:00') }, end: { dateTime: pdt('2026-09-04T11:00') } });
-  const list = cal.api.Events.list;
-  cal.api.Events.list = (calId, params) => {
-    if (calId === PERSONAL && params.privateExtendedProperty) throw new Error('Backend Error');
-    return list(calId, params);
-  };
-
-  assert.throws(() => cs.sync(), /tagging.*failed/i);
-  assert.notEqual(tagOf(added), null);
-  assert.match(cs.logs.error[0], /Backend Error/);
-  cal.api.Events.list = list;
-  cs.sync();
-  assert.equal(tagOf(stale), null);
-});
-
-test('tag updates preserve unrelated private and shared event properties', () => {
-  const { cs, personal } = setup();
-  const ev = personal('2026-09-03T10:00', '2026-09-03T11:00', {
-    extendedProperties: { private: { otherTool: 'keep' }, shared: { sharedKey: 'keep' } },
-  });
-  cs.sync();
-  assert.notEqual(tagOf(ev), null);
-  assert.equal(ev.extendedProperties.private.otherTool, 'keep');
-  assert.deepEqual(ev.extendedProperties.shared, { sharedKey: 'keep' });
-
-  ev.transparency = 'transparent';
-  cs.sync();
-  assert.deepEqual(ev.extendedProperties, { private: { otherTool: 'keep' }, shared: { sharedKey: 'keep' } });
-});
-
-test('clears legacy tags by calendar as well as event id', () => {
-  const { cal, cs, personal } = setup();
-  const other = 'partner@personal.example';
-  cal.addCalendar(other);
-  cs.CONFIG.personalCalendarIds = [PERSONAL, other];
-  const moved = personal('2026-09-03T10:00', '2026-09-03T11:00', { id: 'same-id', iCalUID: 'first-uid' });
-  const kept = cal.addEvent(other, {
-    id: 'same-id', iCalUID: 'second-uid', start: { dateTime: pdt('2026-09-04T10:00') }, end: { dateTime: pdt('2026-09-04T11:00') },
-  });
-  cs.sync();
-  delete moved.extendedProperties.private.calSyncTagged; // A tag written before the searchable marker.
-  moved.start.dateTime = pdt('2026-12-03T10:00');
-  moved.end.dateTime = pdt('2026-12-03T11:00');
-  cs.sync();
-  assert.equal(tagOf(moved), null);
-  assert.notEqual(tagOf(kept), null);
-});
-
-test('a permission failure clearing a tag is reported and remains retryable', () => {
-  const { cal, cs, personal } = setup();
-  const ev = personal('2026-09-03T10:00', '2026-09-03T11:00');
-  cs.sync();
-  const oldTag = tagOf(ev);
-  ev.start.dateTime = pdt('2026-12-03T10:00');
-  ev.end.dateTime = pdt('2026-12-03T11:00');
-  const patch = cal.api.Events.patch;
-  cal.api.Events.patch = (resource, calId, id) => {
-    if (calId === PERSONAL && id === ev.id) {
-      throw Object.assign(new Error('Resource has been deleted or access is forbidden'), { details: { code: 403 } });
-    }
-    return patch(resource, calId, id);
-  };
-  assert.throws(() => cs.sync(), /tagging.*failed.*Make changes to events/i);
-  assert.equal(tagOf(ev), oldTag);
-  assert.match(cs.logs.error.at(-1), /access is forbidden/);
-
-  cal.api.Events.patch = patch;
-  cs.sync();
-  assert.equal(tagOf(ev), null);
-});
-
-test('points the tag at the earliest hold still inside the window', () => {
-  const { cs, clock, personal, holds } = setup({ now: '2026-09-04T09:00' });
-  const ev = personal('2026-09-04T14:00', '2026-09-07T12:00'); // Friday afternoon to Monday noon
-  cs.sync();
-  const [friday, monday] = holds();
-  assert.equal(tagOf(ev), friday.id);
-
-  clock.now = at('2026-09-05T18:00'); // the Friday hold is now behind the window
-  cs.sync();
-  assert.equal(tagOf(ev), monday.id);
-  assert.equal(holds().length, 2);
-});
-
-test('tags a recurring event once, on the series, never on its occurrences', () => {
-  const { cal, cs, series, holds } = setup();
-  const { master, occurrences } = series('yoga', '2026-09-03T12:00', '2026-09-03T13:00', [0, 1, 2]);
-  cs.sync();
-
-  assert.equal(holds().length, 3);
-  assert.equal(tagOf(master), holds()[0].id);
-  assert.deepEqual(occurrences.map(tagOf), [null, null, null]);
-  assert.equal(cal.calls.filter(c => c === 'Events.patch').length, 1);
-  assert.deepEqual(holds().map(h => h.extendedProperties.private.sourceEventId), ['yoga', 'yoga', 'yoga']);
-});
-
-test('does not rewrite a series tag because an occurrence carries a stale copy of it', () => {
-  const { cal, cs, series } = setup();
-  const { master, occurrences } = series('yoga', '2026-09-03T12:00', '2026-09-03T13:00', [0, 1]);
-  occurrences[0].extendedProperties = { private: { workHoldId: 'old-hold' } }; // tagged by an earlier version
-  cs.sync();
-  const tag = tagOf(master);
-  assert.notEqual(tag, null);
-
-  cal.calls.length = 0;
-  cs.sync();
-  assert.deepEqual(cal.writes(), []);
-  assert.equal(tagOf(master), tag);
-});
-
-test('clears a series tag once no occurrence needs a hold', () => {
-  const { cs, series, holds } = setup();
-  const { master, occurrences } = series('yoga', '2026-09-03T12:00', '2026-09-03T13:00', [0, 1]);
-  cs.sync();
-  assert.notEqual(tagOf(master), null);
-
-  for (const occurrence of occurrences) occurrence.transparency = 'transparent';
-  cs.sync();
-  assert.equal(holds().length, 0);
-  assert.equal(tagOf(master), null);
-});
-
-test('re-creates a hold that was deleted by hand on the work calendar', () => {
-  const { cal, cs, personal, holds } = setup();
-  const ev = personal('2026-09-03T10:00', '2026-09-03T11:00');
-  cs.sync();
-  cal.api.Events.remove(WORK, holds()[0].id);
-  cs.sync();
-  assert.equal(holds().length, 1);
-  assert.equal(tagOf(ev), holds()[0].id);
+  assert.deepEqual(times(), expected);
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 3 created, 3 removed');
 });
 
 test('applies a changed holdVisibility to existing holds', () => {
@@ -425,223 +230,131 @@ test('applies a changed holdVisibility to existing holds', () => {
   cs.sync();
   cs.CONFIG.holdVisibility = 'default';
   cs.sync();
-  assert.equal(holds()[0].visibility, 'default');
-  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 1 updated, 0 removed');
+  assert.equal(holds()[0].visibility, undefined); // The API leaves default visibility out
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 1 created, 1 removed');
 
-  delete holds()[0].visibility; // the API leaves the field out for default visibility
   cs.sync();
-  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 0 updated, 0 removed');
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 0 removed');
 });
 
-test('holds each weekday of a multi-day event, leaving fully covered workdays to Out of Office', () => {
-  const { cs, personal, times } = setup();
-  personal('2026-09-07T15:00', '2026-09-09T11:00'); // Monday afternoon to Wednesday morning
-  personal('2026-09-13T22:00', '2026-09-14T10:00'); // Sunday night to Monday morning
+test('removes the holds of a calendar taken out of CONFIG', () => {
+  const { cal, cs, personal, times } = setup();
+  cal.addCalendar(OTHER, { readOnly: true });
+  cs.CONFIG.personalCalendarIds = [PERSONAL, OTHER];
+  personal('2026-09-03T10:00', '2026-09-03T11:00');
+  personal('2026-09-03T14:00', '2026-09-03T15:00', {}, OTHER);
+  cs.sync();
+  assert.equal(times().length, 2);
+
+  cs.CONFIG.personalCalendarIds = [PERSONAL];
+  cs.sync();
+  assert.deepEqual(times(), [['2026-09-03 10:00', '2026-09-03 11:00']]);
+});
+
+test('leaves the work calendar\'s own events alone, even ones that look like holds', () => {
+  const { cal, cs, personal } = setup();
+  const own = [
+    cal.addEvent(WORK, { summary: 'Standup', start: { dateTime: pdt('2026-09-03T10:00') }, end: { dateTime: pdt('2026-09-03T10:30') } }),
+    cal.addEvent(WORK, { summary: 'Weekly', recurrence: ['RRULE:FREQ=WEEKLY'], start: { dateTime: pdt('2026-09-03T14:00') }, end: { dateTime: pdt('2026-09-03T15:00') } }),
+    cal.addEvent(WORK, { eventType: 'outOfOffice', start: { date: '2026-09-10' }, end: { date: '2026-09-11' } }),
+    cal.addEvent(WORK, { summary: '[DNS] External Appointment', start: { dateTime: pdt('2026-09-04T10:00') }, end: { dateTime: pdt('2026-09-04T11:00') } }),
+  ];
+  personal('2026-09-03T10:00', '2026-09-03T11:00');
+  cs.sync();
+  cs.uninstall();
+  assert.deepEqual(cal.live(WORK).map(ev => ev.id), own.map(ev => ev.id));
+  assert.deepEqual(cs.logs.error, []);
+});
+
+test('keeps today and the next syncDaysAhead days in step, and leaves earlier days alone', () => {
+  const { cs, clock, personal, times } = setup();
+  const earlier = personal('2026-09-02T09:00', '2026-09-02T10:00'); // over by noon
+  const lunch = personal('2026-09-02T11:00', '2026-09-02T11:30');
+  personal('2026-09-30T10:00', '2026-09-30T11:00'); // the last day in the window
+  personal('2026-10-01T10:00', '2026-10-01T11:00'); // the day after
   cs.sync();
   assert.deepEqual(times(), [
-    ['2026-09-07T22:00:00.000Z', '2026-09-08T00:00:00.000Z'], // Mon 15:00–17:00
-    ['2026-09-09T16:00:00.000Z', '2026-09-09T18:00:00.000Z'], // Wed 09:00–11:00; Tuesday would be a full workday
-    ['2026-09-14T16:00:00.000Z', '2026-09-14T17:00:00.000Z'], // Mon 09:00–10:00
+    ['2026-09-02 09:00', '2026-09-02 10:00'],
+    ['2026-09-02 11:00', '2026-09-02 11:30'],
+    ['2026-09-30 10:00', '2026-09-30 11:00'],
+  ]);
+
+  lunch.status = 'cancelled'; // today is still in step
+  cs.sync();
+  clock.now = at('2026-09-03T08:00');
+  earlier.status = 'cancelled'; // yesterday is history
+  cs.sync();
+  assert.deepEqual(times(), [
+    ['2026-09-02 09:00', '2026-09-02 10:00'],
+    ['2026-09-30 10:00', '2026-09-30 11:00'],
+    ['2026-10-01 10:00', '2026-10-01 11:00'],
   ]);
 });
 
-test('never duplicates the holds of an event that keeps overlapping the window', () => {
-  const { cs, clock, personal, holds } = setup({ now: '2026-09-04T09:00' });
+test('never duplicates the holds of an event that started before today', () => {
+  const { cs, clock, personal, times } = setup({ now: '2026-09-04T09:00' });
   personal('2026-09-04T14:00', '2026-09-07T12:00'); // Friday afternoon to Monday noon
-  cs.sync();
-  assert.equal(holds().length, 2);
-
-  for (const later of ['2026-09-05T18:00', '2026-09-05T18:05', '2026-09-06T10:00', '2026-09-07T09:00', '2026-09-08T09:00']) {
-    clock.now = at(later);
+  for (const now of ['2026-09-04T09:00', '2026-09-05T18:00', '2026-09-07T09:00', '2026-09-08T09:00']) {
+    clock.now = at(now);
     cs.sync();
-    assert.equal(holds().length, 2, `hold count changed at ${later}`);
   }
+  assert.deepEqual(times(), [['2026-09-04 14:00', '2026-09-04 17:00'], ['2026-09-07 09:00', '2026-09-07 12:00']]);
 });
 
-test('waits for a hold to enter the window instead of duplicating it at the far edge', () => {
-  const { cs, clock, personal, holds } = setup({ now: '2026-09-02T07:00' });
-  personal('2026-09-30T06:30', '2026-09-30T09:30'); // starts inside the window, its hold would start outside
-  for (const t of ['07:00', '07:05', '08:55', '09:00']) { // at 09:00 the hold would start exactly at the (exclusive) window end
-    clock.now = at(`2026-09-02T${t}`);
-    cs.sync();
-    assert.equal(holds().length, 0, `hold created too early at ${t}`);
+test('reads every page of results', () => {
+  const { cal, cs, personal } = setup(); // The fake serves two events per page
+  for (let day = 14; day <= 18; day++) {
+    personal(`2026-09-${day}T10:00`, `2026-09-${day}T11:00`);
+    cal.addEvent(WORK, { summary: 'Meeting', start: { dateTime: pdt(`2026-09-${day}T15:00`) }, end: { dateTime: pdt(`2026-09-${day}T16:00`) } });
   }
-  for (const t of ['09:05', '09:10']) {
-    clock.now = at(`2026-09-02T${t}`);
-    cs.sync();
-    assert.equal(holds().length, 1, `wrong hold count at ${t}`);
-  }
-});
-
-test('replaces duplicate holds, holds edited into all-day events, and holds from earlier versions', () => {
-  const { cal, cs, personal, holds, times } = setup();
-  const ev = personal('2026-09-03T10:00', '2026-09-03T11:00');
-  const hold = (extra) => cal.addEvent(WORK, {
-    summary: cs.HOLD_TITLE, visibility: 'private',
-    extendedProperties: { private: { sourceUid: ev.id, sourceEventId: ev.id, sourceCalendarId: PERSONAL } }, ...extra,
-  });
-  hold({ start: { dateTime: pdt('2026-09-03T10:00') }, end: { dateTime: pdt('2026-09-03T11:00') } });
-  hold({ start: { dateTime: pdt('2026-09-03T10:00') }, end: { dateTime: pdt('2026-09-03T11:00') } }); // duplicate
-  hold({ start: { date: '2026-09-03' }, end: { date: '2026-09-04' } }); // edited into an all-day event
-  cal.addEvent(WORK, { // made by a version that did not record sourceUid
-    summary: cs.HOLD_TITLE, start: { dateTime: pdt('2026-09-04T10:00') }, end: { dateTime: pdt('2026-09-04T11:00') },
-    extendedProperties: { private: { sourceEventId: 'old', sourceCalendarId: PERSONAL } },
-  });
   cs.sync();
-  assert.deepEqual(times(), [['2026-09-03T17:00:00.000Z', '2026-09-03T18:00:00.000Z']]);
-  assert.equal(holds().length, 1);
-  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 0 updated, 3 removed');
-});
-
-test('skips holds fully covered by Out of Office, timed or all-day, but keeps partially covered ones', () => {
-  const { cal, cs, personal, holds } = setup();
-  cal.addEvent(WORK, { eventType: 'outOfOffice', start: { dateTime: pdt('2026-09-03T09:00') }, end: { dateTime: pdt('2026-09-03T12:00') } });
-  cal.addEvent(WORK, { eventType: 'outOfOffice', start: { date: '2026-09-04' }, end: { date: '2026-09-05' } });
-  personal('2026-09-03T10:00', '2026-09-03T11:00'); // inside the timed OOO
-  personal('2026-09-04T10:00', '2026-09-04T11:00'); // inside the all-day OOO
-  const partial = personal('2026-09-03T11:30', '2026-09-03T13:00'); // straddles the end of the timed OOO
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 5 created, 0 removed');
   cs.sync();
-
-  assert.equal(holds().length, 1);
-  assert.equal(holds()[0].extendedProperties.private.sourceEventId, partial.id);
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 0 removed');
 });
 
-test('creates a single hold when the same invitation is on two personal calendars', () => {
-  const { cal, cs, holds } = setup();
-  const other = 'partner@personal.example';
-  cal.addCalendar(other);
-  cs.CONFIG.personalCalendarIds = [PERSONAL, other];
-  const invite = { start: { dateTime: pdt('2026-09-03T10:00') }, end: { dateTime: pdt('2026-09-03T11:00') } };
-  const google = [PERSONAL, other].map(calId => cal.addEvent(calId, { id: 'native-invite', iCalUID: 'native@google.com', ...invite })); // same id everywhere
-  const external = [PERSONAL, other].map(calId => cal.addEvent(calId, { iCalUID: 'outlook-uid', ...invite, start: { dateTime: pdt('2026-09-04T10:00') }, end: { dateTime: pdt('2026-09-04T11:00') } })); // imported separately
+// ── Failures ────────────────────────────────────────────────
+
+test('a failed change does not stop the others, fails the run, and is retried by the next', () => {
+  const { cal, cs, personal, times } = setup();
+  const gone = personal('2026-09-03T10:00', '2026-09-03T11:00');
   cs.sync();
-
-  assert.equal(holds().length, 2);
-  assert.deepEqual(google.map(tagOf), [holds()[0].id, holds()[0].id]);
-  assert.deepEqual(external.map(tagOf), [holds()[1].id, holds()[1].id]);
-  assert.equal(cs.logs.log.at(-1), 'CalSync: 2 created, 0 updated, 0 removed');
-});
-
-test('keeps one hold per day for a series shared across two personal calendars', () => {
-  const { cal, cs, series, holds } = setup();
-  const other = 'partner@personal.example';
-  cal.addCalendar(other);
-  cs.CONFIG.personalCalendarIds = [PERSONAL, other];
-  series('yoga', '2026-09-03T12:00', '2026-09-03T13:00', [0, 1], { iCalUID: 'yoga@google.com' });
-  series('yoga-copy', '2026-09-03T12:00', '2026-09-03T13:00', [0, 1], { iCalUID: 'yoga@google.com' }, other); // different ids, shared uid
-  cs.sync();
-  assert.equal(holds().length, 2);
-  assert.equal(cs.logs.log.at(-1), 'CalSync: 2 created, 0 updated, 0 removed');
-});
-
-test('a calendar is dropped by uninstalling before taking it out of CONFIG', () => {
-  const { cal, cs, personal, holds } = setup();
-  const other = 'old@personal.example';
-  cal.addCalendar(other);
-  cs.CONFIG.personalCalendarIds = [PERSONAL, other];
-  personal('2026-09-03T10:00', '2026-09-03T11:00');
-  cal.addEvent(other, { start: { dateTime: pdt('2026-09-03T14:00') }, end: { dateTime: pdt('2026-09-03T15:00') } });
-  cs.install();
-  assert.equal(holds().length, 2);
-
-  cs.uninstall();
-  cs.CONFIG.personalCalendarIds = [PERSONAL];
-  cs.install();
-  assert.equal(holds().length, 1);
-  assert.equal(holds()[0].extendedProperties.private.sourceCalendarId, PERSONAL);
-});
-
-test('walks every page of results', () => {
-  const { cs, personal, holds } = setup(); // the fake serves two events per page
-  for (let day = 14; day <= 18; day++) personal(`2026-09-${day}T10:00`, `2026-09-${day}T11:00`);
-  cs.sync();
-  assert.equal(holds().length, 5);
-});
-
-test('works with read-only access to the personal calendar when tagging is off', () => {
-  const { cal, cs, personal, holds } = setup({ readOnly: true });
-  cs.CONFIG.tagPersonalEvents = false;
-  personal('2026-09-03T10:00', '2026-09-03T11:00');
+  gone.status = 'cancelled';
   personal('2026-09-04T10:00', '2026-09-04T11:00');
+  personal('2026-09-08T10:00', '2026-09-08T11:00');
+  const insert = cal.api.Events.insert;
+  cal.api.Events.insert = (resource, calId) => {
+    if (Date.parse(resource.start.dateTime) === at('2026-09-04T10:00')) throw new Error('Backend Error');
+    return insert(resource, calId);
+  };
+
+  assert.throws(() => cs.sync(), /1 hold change\(s\) failed\. Could not create the hold at 2026-09-04T17:00:00\.000Z \(Backend Error\)/);
+  assert.deepEqual(times(), [['2026-09-08 10:00', '2026-09-08 11:00']]);
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 1 created, 1 removed');
+
+  cal.api.Events.insert = insert;
   cs.sync();
-  assert.equal(holds().length, 2);
-  assert.ok(!cal.calls.includes('Events.patch'));
+  assert.deepEqual(times(), [['2026-09-04 10:00', '2026-09-04 11:00'], ['2026-09-08 10:00', '2026-09-08 11:00']]);
 });
 
-test('explains the missing permission when tagging is on and the personal calendar is read-only', () => {
-  const { cs, personal } = setup({ readOnly: true });
-  personal('2026-09-03T10:00', '2026-09-03T11:00');
-  assert.throws(() => cs.install(), /Make changes to events.*tagPersonalEvents/);
-  assert.equal(cs.triggers.length, 0);
-});
-
-test('install syncs first and only then schedules the trigger; uninstall removes everything', () => {
-  const { cal, cs, personal, holds } = setup();
-  personal('2026-09-03T10:00', '2026-09-03T11:00');
-  const oldHold = { // far outside the sync window
-    summary: cs.HOLD_TITLE, start: { dateTime: '2025-01-06T17:00:00Z' }, end: { dateTime: '2025-01-06T18:00:00Z' },
-    extendedProperties: { private: { sourceEventId: 'old', sourceCalendarId: PERSONAL } },
+test('a failed read changes nothing', () => {
+  const { cal, cs, personal, times } = setup();
+  cal.addCalendar(OTHER, { readOnly: true });
+  cs.CONFIG.personalCalendarIds = [PERSONAL, OTHER];
+  const ev = personal('2026-09-03T10:00', '2026-09-03T11:00');
+  cs.sync();
+  ev.status = 'cancelled';
+  personal('2026-09-04T10:00', '2026-09-04T11:00');
+  const list = cal.api.Events.list;
+  cal.api.Events.list = (calId, params) => {
+    if (calId === OTHER) throw new Error('Backend Error');
+    return list(calId, params);
   };
-  cal.addEvent(WORK, oldHold);
 
-  cs.install();
-  assert.equal(holds().length, 1);
-  assert.deepEqual(cs.triggers.map(t => [t.getHandlerFunction(), t.minutes]), [['sync', 5]]);
-
-  cs.install(); // re-running replaces the trigger instead of stacking a second one
-  assert.equal(cs.triggers.length, 1);
-
-  cal.addEvent(WORK, oldHold);
-  cs.uninstall();
-  assert.equal(holds().length, 0);
-  assert.equal(cs.triggers.length, 0);
-  assert.equal(cs.logs.log.at(-1), 'CalSync uninstalled: removed 2 holds and the sync trigger');
-});
-
-test('install clears legacy tags outside the window; uninstall clears current tags and can be retried', () => {
-  const { cal, cs, personal, holds } = setup();
-  const legacy = personal('2026-12-03T10:00', '2026-12-03T11:00', {
-    extendedProperties: { private: { workHoldId: 'old-hold' } },
-  });
-  const current = personal('2026-09-03T10:00', '2026-09-03T11:00');
-  cs.install();
-  assert.equal(tagOf(legacy), null);
-  assert.notEqual(tagOf(current), null);
-
-  const patch = cal.api.Events.patch;
-  cal.api.Events.patch = (resource, calId, id) => {
-    if (calId === PERSONAL && id === current.id) throw new Error('Backend Error');
-    return patch(resource, calId, id);
-  };
-  assert.throws(() => cs.uninstall(), /tagging.*failed/i);
-  assert.equal(holds().length, 0);
-  assert.equal(cs.triggers.length, 0);
-  cal.api.Events.patch = patch;
-  cs.uninstall();
-  assert.equal(tagOf(current), null);
-});
-
-test('install leaves no trigger behind when the first sync fails', () => {
-  const { cs } = setup();
-  cs.CONFIG.personalCalendarIds = ['not.shared@personal.example'];
-  assert.throws(() => cs.install(), /Not Found/);
-  assert.equal(cs.triggers.length, 0);
-});
-
-test('rejects an unedited or inconsistent CONFIG before touching any calendar', () => {
-  const { cal, cs } = setup();
-  cs.CONFIG.personalCalendarIds = ['your.personal@email.com'];
-  assert.throws(() => cs.sync(), /personalCalendarIds/);
-  assert.throws(() => cs.install(), /personalCalendarIds/);
-  cs.CONFIG.personalCalendarIds = [];
-  assert.throws(() => cs.sync(), /personalCalendarIds/);
-
-  cs.CONFIG.personalCalendarIds = [PERSONAL];
-  cs.CONFIG.workStartHour = 17;
-  cs.CONFIG.workEndHour = 9;
-  assert.throws(() => cs.sync(), /workStartHour/);
-  assert.throws(() => cs.install(), /workStartHour/);
-  assert.deepEqual(cal.calls, []);
+  cal.calls.length = 0;
+  assert.throws(() => cs.sync(), /Backend Error/);
+  assert.deepEqual(cal.writes(), []);
+  assert.deepEqual(times(), [['2026-09-03 10:00', '2026-09-03 11:00']]);
 });
 
 test('refuses to overlap with a run that is still in progress', () => {
@@ -651,23 +364,64 @@ test('refuses to overlap with a run that is still in progress', () => {
   assert.deepEqual(cal.calls, []);
 });
 
-test('workRanges evaluates days and hours in the work calendar time zone', () => {
-  const { cs } = setup();
-  const ranges = (start, end, tz) => [...cs.workRanges(Date.parse(start), Date.parse(end), tz, [])]
-    .map(r => [new Date(r.start).toISOString(), new Date(r.end).toISOString()]);
+test('rejects an unedited or inconsistent CONFIG before touching any calendar', () => {
+  const { cal, cs } = setup();
+  cs.CONFIG.personalCalendarIds = ['your.personal@email.com'];
+  assert.throws(() => cs.install(), /personalCalendarIds/);
+  cs.CONFIG.personalCalendarIds = [];
+  assert.throws(() => cs.sync(), /personalCalendarIds/);
 
-  assert.deepEqual(ranges('2026-09-04T23:30:00Z', '2026-09-05T01:00:00Z', 'Asia/Tokyo'), []); // Saturday morning in Tokyo
-  assert.deepEqual(ranges('2026-09-05T02:00:00Z', '2026-09-05T03:00:00Z', 'America/Los_Angeles'), []); // Friday 7 PM in Los Angeles
-  assert.deepEqual(ranges('2026-09-04T00:30:00Z', '2026-09-04T02:00:00Z', 'Asia/Tokyo'), // Friday 09:30–11:00 JST
-    [['2026-09-04T00:30:00.000Z', '2026-09-04T02:00:00.000Z']]);
-  assert.deepEqual(ranges('2026-09-04T00:30:00Z', '2026-09-04T10:00:00Z', 'Asia/Kolkata'), // Friday 06:00–15:30 IST
-    [['2026-09-04T03:30:00.000Z', '2026-09-04T10:00:00.000Z']]);
-  assert.deepEqual(ranges('2026-09-04T00:30:00Z', '2026-09-06T02:00:00Z', 'Asia/Kolkata'), []); // Fri 06:00 to Sun 07:30 IST: a full Friday workday, then weekend
+  cs.CONFIG.personalCalendarIds = [PERSONAL];
+  for (const [start, end] of [[17, 9], [9, 9], [8.5, 17], [-1, 17], [9, 25]]) {
+    Object.assign(cs.CONFIG, { workStartHour: start, workEndHour: end });
+    assert.throws(() => cs.sync(), /workStartHour/, `${start}–${end}`);
+  }
+  assert.deepEqual(cal.calls, []);
+  assert.equal(cs.triggers.length, 0);
 });
 
-test('day iteration stays on local midnight across DST switches and large offsets', () => {
+// ── Install and uninstall ───────────────────────────────────
+
+test('install syncs, then schedules one trigger, and running it again changes nothing', () => {
+  const { cal, cs, personal, holds } = setup();
+  personal('2026-09-03T10:00', '2026-09-03T11:00');
+  cs.install();
+  assert.deepEqual(cs.triggers.map(t => [t.getHandlerFunction(), t.minutes]), [['sync', 5]]);
+  const ids = holds().map(h => h.id);
+
+  cal.calls.length = 0;
+  cs.install();
+  assert.deepEqual(cal.writes(), []);
+  assert.deepEqual(holds().map(h => h.id), ids);
+  assert.equal(cs.triggers.length, 1);
+});
+
+test('install leaves no trigger behind when the first sync fails', () => {
   const { cs } = setup();
-  for (const [date, tz] of [['2026-03-08', 'America/Los_Angeles'], ['2026-10-04', 'Australia/Sydney'], ['2026-09-27', 'Pacific/Auckland'], ['2026-09-02', 'Pacific/Kiritimati']]) {
-    assert.equal(formatDate(new Date(cs.midnightInTz(date, tz)), tz, 'yyyy-MM-dd HH:mm'), `${date} 00:00`, `${tz} ${date}`);
-  }
+  cs.CONFIG.personalCalendarIds = ['not.shared@personal.example'];
+  assert.throws(() => cs.install(), /Not Found/);
+  assert.equal(cs.triggers.length, 0);
+});
+
+test('uninstall removes the trigger and every hold, past and future, and can be rerun', () => {
+  const { cal, cs, personal, holds } = setup();
+  cal.addEvent(WORK, { id: 'csdnshold0past', summary: '[DNS] External Appointment', start: { dateTime: '2025-01-06T17:00:00Z' }, end: { dateTime: '2025-01-06T18:00:00Z' } });
+  personal('2026-09-03T10:00', '2026-09-03T11:00');
+  personal('2026-09-04T10:00', '2026-09-04T11:00');
+  cs.install();
+  assert.equal(holds().length, 3);
+
+  const remove = cal.api.Events.remove;
+  cal.api.Events.remove = (calId, id) => {
+    if (id === 'csdnshold0past') throw new Error('Backend Error');
+    return remove(calId, id);
+  };
+  assert.throws(() => cs.uninstall(), /1 hold change\(s\) failed/);
+  assert.equal(cs.triggers.length, 0);
+  assert.deepEqual(holds().map(h => h.id), ['csdnshold0past']);
+
+  cal.api.Events.remove = remove;
+  cs.uninstall();
+  assert.equal(holds().length, 0);
+  assert.equal(cs.logs.log.at(-1), 'CalSync: 0 created, 1 removed');
 });
