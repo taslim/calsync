@@ -1,33 +1,35 @@
 # CalSync 📅
 
-A Google Apps Script that mirrors your personal calendar as `[DNS] External Appointment` holds on your work calendar, so colleagues see that you are busy without seeing why.
+A Google Apps Script that mirrors the busy time on your personal calendars as `[DNS] External Appointment` holds on your work calendar, so colleagues see that you are busy without seeing why.
 
 ## What it does
 
-- Clamps each personal event to your work hours, in your work calendar's time zone, with one hold per weekday it touches.
-- Ignores all-day events, events marked Free, invitations without a Yes response, and weekends.
+- Holds the work-hour part of each personal event, in your work calendar's time zone, with one hold per weekday it touches.
+- Ignores all-day events, events marked Free, invitations you have not accepted, and weekends.
 - Skips holds fully covered by an Out of Office block, and holds that would fill a whole workday (use Out of Office for those).
-- Keeps holds in step with their events: they move, shrink, and disappear as the personal event changes. Runs every 5 minutes and stores nothing outside the two calendars.
-- Tags each mirrored personal event, or recurring series, with the id of its earliest hold in the window (`workHoldId`, a private extended property), so tools that only see your personal calendar can tell holds from real conflicts. Optional.
+- Keeps today and the next 28 days in step every 5 minutes: holds appear, move, and disappear with your personal events. Earlier days are left as they were.
+- Only reads your personal calendars, and stores nothing outside the two calendars.
+
+## Telling holds from meetings
+
+Every hold's event ID starts with `csdnshold`. Anyone with free/busy access to your work calendar, a person or an agent, gets each event's ID, start, and end when they list its events, so they can set holds aside and treat the rest as work commitments. A free/busy query merges busy time and returns no IDs, so list events instead.
 
 ## Setup
 
-1. On your personal account, share the calendar with your work account: Settings › Settings for my calendars › your calendar › Share with specific people. Permission: **Make changes to events**, or **See all event details** if you turn `tagPersonalEvents` off. Free/busy is not enough.
+1. On your personal account, share the calendar with your work account: Settings › Settings for my calendars › your calendar › Share with specific people. Permission: **See all event details**. Free/busy is not enough.
 2. On your work account, open [script.google.com](https://script.google.com/), create a project, and paste `Code.js` into it.
 3. Edit `CONFIG` at the top: your personal calendar address(es), work hours, and anything else you want changed.
 4. Add the **Google Calendar API** under Services (the `+` in the sidebar).
 5. Run `install` from the function dropdown and grant the permissions it asks for (Advanced › Go to project).
 
-Each run logs what it created, updated, and removed under Executions. Tagging failures are logged and retried by scheduled runs without blocking other updates.
+Each run logs what it created and removed under Executions. A change that fails marks the run as failed and is retried by the next one.
 
 ## Everyday use
 
-- **Change a setting:** edit `CONFIG` and save. The next run applies it to existing holds.
-- **Skip one event:** mark it Free, or answer Maybe or No on your personal calendar. Deleting the hold only brings it back on the next run.
-- **Read the tag:** `workHoldId` is present while the event has a hold within the 28-day window and cleared once it needs none. A recurring event carries it on the series, so every occurrence shows it.
-- **Remove a calendar:** run `uninstall`, take it out of `CONFIG`, then run `install`. Holds are looked up by calendar, so its holds would otherwise stay.
-- **Upgrade:** paste the new `Code.js` and run `install` once. It rebuilds the holds and clears old tags.
-- **Stop:** run `uninstall`. It removes the trigger, holds, and tags. Rerun it if tag cleanup fails.
+- **Change a setting:** edit `CONFIG`, including the list of calendars, and save. The next run applies it to existing holds.
+- **Skip one event:** mark it Free, or answer Maybe or No on your personal calendar. Deleting or editing a hold only brings it back on the next run.
+- **Upgrade:** paste the new `Code.js` and save. From a version whose holds lack `csdnshold` IDs, run `uninstall` with the old code first.
+- **Stop:** run `uninstall`. It removes the trigger and every hold. Rerun it if it reports a failure.
 
 ## Development
 

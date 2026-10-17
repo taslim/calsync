@@ -1,48 +1,53 @@
 // In-memory stand-ins for the Apps Script globals Code.js uses (Utilities, Calendar,
 // ScriptApp, LockService, console, Date), so the sync logic can run under `node --test`.
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const SOURCE = readFileSync(new URL('../Code.js', import.meta.url), 'utf8');
-const ISO_DAY = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
 
-/** Utilities.formatDate for the SimpleDateFormat patterns Code.js and the tests rely on. */
+/** Utilities.formatDate for the patterns Code.js and the tests use. */
 export function formatDate(date, tz, pattern) {
-  const p = Object.fromEntries(
-    new Intl.DateTimeFormat('en-US', {
-      timeZone: tz, hourCycle: 'h23', weekday: 'short',
-      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
-    }).formatToParts(date).filter(x => x.type !== 'literal').map(x => [x.type, x.value]),
-  );
+  const p = wallClockParts(date.getTime(), tz);
   switch (pattern) {
-    case 'u': return String(ISO_DAY[p.weekday]);
     case 'yyyy-MM-dd': return `${p.year}-${p.month}-${p.day}`;
     case 'yyyy-MM-dd HH:mm': return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
     default: throw new Error(`formatDate pattern not faked: ${pattern}`);
   }
 }
 
-/** Utilities.parseDate for the one pattern Code.js uses: a calendar day read as local midnight in tz. */
+/** Utilities.parseDate for the one pattern Code.js uses: an hour on a day's wall clock in tz. */
 export function parseDate(text, tz, pattern) {
-  if (pattern !== 'yyyy-MM-dd') throw new Error(`parseDate pattern not faked: ${pattern}`);
-  const utcMidnight = Date.parse(`${text}T00:00:00Z`);
-  // The offset can change between UTC midnight and local midnight (a DST switch), so re-read it at the estimate.
-  const estimate = utcMidnight - offsetMs(utcMidnight, tz);
-  return new Date(utcMidnight - offsetMs(estimate, tz));
+  const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{1,2})$/.exec(text);
+  if (pattern !== 'yyyy-MM-dd H' || !match) throw new Error(`parseDate not faked for ${pattern}: ${text}`);
+  const [, year, month, day, hour] = match.map(Number);
+  const wall = Date.UTC(year, month - 1, day, hour); // Hour 24 rolls over to the next day, as lenient parsing does
+  // The offset can change between the wall-clock reading and the instant (a DST switch), so re-read it at the estimate.
+  const estimate = wall - offsetMs(wall, tz);
+  return new Date(wall - offsetMs(estimate, tz));
+}
+
+function wallClockParts(ms, tz) {
+  return Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(new Date(ms)).filter(x => x.type !== 'literal').map(x => [x.type, x.value]),
+  );
 }
 
 function offsetMs(ms, tz) {
-  const p = Object.fromEntries(
-    new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      .formatToParts(new Date(ms)).filter(x => x.type !== 'literal').map(x => [x.type, x.value]),
-  );
+  const p = wallClockParts(ms, tz);
   return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - ms;
 }
 
 const clone = x => JSON.parse(JSON.stringify(x));
 const boundary = part => Date.parse(part.dateTime ?? `${part.date}T00:00:00Z`);
 
-/** Calendar advanced service with the list-filter semantics of the real API. */
+/** The item fields a `fields` parameter asks for: 'nextPageToken,items(id,start)' → ['id', 'start']. */
+const itemFields = fields => /items\(([^)]*)\)/.exec(fields)[1].split(',');
+const pick = (ev, fields) => Object.fromEntries(fields.filter(f => f in ev).map(f => [f, clone(ev[f])]));
+
+/** Calendar advanced service with the list, ID, and field semantics of the real API. */
 export function fakeCalendar({ pageSize = 2 } = {}) {
   const calendars = new Map();
   const cursors = new Map();
@@ -58,11 +63,6 @@ export function fakeCalendar({ pageSize = 2 } = {}) {
     const cal = get(id);
     if (cal.readOnly) throw new Error('Forbidden');
     return cal;
-  };
-  const live = (cal, id) => {
-    const ev = cal.events.get(id);
-    if (!ev || ev.status === 'cancelled') throw new Error('Not Found');
-    return ev;
   };
 
   const api = {
@@ -83,55 +83,37 @@ export function fakeCalendar({ pageSize = 2 } = {}) {
             // timeMin bounds the END (exclusive), timeMax bounds the START (exclusive), as in the real API.
             if (params.timeMin && !(boundary(ev.end) > Date.parse(params.timeMin))) return false;
             if (params.timeMax && !(boundary(ev.start) < Date.parse(params.timeMax))) return false;
-            if (params.privateExtendedProperty) {
-              const [key, value] = params.privateExtendedProperty.split('=');
-              if (ev.extendedProperties?.private?.[key] !== value) return false;
-            }
             if (params.eventTypes && !params.eventTypes.includes(ev.eventType ?? 'default')) return false;
             return true;
           });
-          if (params.orderBy === 'startTime') items.sort((a, b) => boundary(a.start) - boundary(b.start));
           cursor = { items, offset: 0 };
         }
-        const page = cursor.items.slice(cursor.offset, cursor.offset + pageSize);
-        const res = { items: clone(page.filter(ev => ev.status !== 'cancelled')) };
-        if (cursor.offset + pageSize < cursor.items.length) {
+        const page = cursor.items.slice(cursor.offset, cursor.offset + pageSize).filter(ev => ev.status !== 'cancelled');
+        const fields = params.fields && itemFields(params.fields);
+        const res = { items: page.map(ev => (fields ? pick(ev, fields) : clone(ev))) };
+        // A `fields` parameter that leaves out nextPageToken drops it, and with it every later page.
+        const tokenRequested = !params.fields || params.fields.split(',').includes('nextPageToken');
+        if (cursor.offset + pageSize < cursor.items.length && tokenRequested) {
           res.nextPageToken = `tok${cursors.size + 1}`;
           cursors.set(res.nextPageToken, { items: cursor.items, offset: cursor.offset + pageSize });
         }
         return res;
       },
-      get(calId, id) {
-        calls.push('Events.get');
-        return clone(live(get(calId), id));
-      },
       insert(resource, calId) {
         calls.push('Events.insert');
-        const ev = { ...clone(resource), id: `ev${++seq}` };
-        writable(calId).events.set(ev.id, ev);
-        return clone(ev);
-      },
-      patch(resource, calId, id) {
-        calls.push('Events.patch');
-        const ev = live(writable(calId), id);
-        const { extendedProperties, ...fields } = clone(resource);
-        Object.assign(ev, fields);
-        // Calendar merges property maps; null deletes a key without replacing unrelated properties.
-        if (extendedProperties) {
-          ev.extendedProperties ??= {};
-          for (const [scope, props] of Object.entries(extendedProperties)) {
-            const target = ev.extendedProperties[scope] ??= {};
-            for (const [key, value] of Object.entries(props)) {
-              if (value === null) delete target[key];
-              else target[key] = value;
-            }
-          }
-        }
+        const cal = writable(calId);
+        const ev = { ...clone(resource), id: resource.id ?? `ev${++seq}` };
+        if (resource.id && !/^[a-v0-9]{5,1024}$/.test(ev.id)) throw new Error('Invalid resource id value.');
+        if (cal.events.has(ev.id)) throw new Error('The requested identifier already exists.'); // Deleted events keep their IDs
+        if (ev.visibility === 'default') delete ev.visibility; // The API leaves default visibility out
+        cal.events.set(ev.id, ev);
         return clone(ev);
       },
       remove(calId, id) {
         calls.push('Events.remove');
-        live(writable(calId), id).status = 'cancelled';
+        const ev = writable(calId).events.get(id);
+        if (!ev || ev.status === 'cancelled') throw new Error('Not Found');
+        ev.status = 'cancelled';
       },
     },
   };
@@ -149,14 +131,14 @@ export function fakeCalendar({ pageSize = 2 } = {}) {
     },
     /** Live (not cancelled) events on a calendar. */
     live: calId => [...get(calId).events.values()].filter(ev => ev.status !== 'cancelled'),
-    writes: () => calls.filter(c => !['Events.list', 'Events.get', 'Calendars.get'].includes(c)),
+    writes: () => calls.filter(c => !['Events.list', 'Calendars.get'].includes(c)),
   };
 }
 
 /** Loads Code.js into a sandbox wired to the fakes and returns its top-level bindings. */
 export function loadCalSync({ calendar, now = () => Date.now(), lockAvailable = true }) {
   const triggers = [];
-  const logs = { log: [], warn: [], error: [] };
+  const logs = { log: [], error: [] };
 
   class FakeDate extends Date {
     constructor(...args) { super(...(args.length ? args : [FakeDate.now()])); }
@@ -175,13 +157,13 @@ export function loadCalSync({ calendar, now = () => Date.now(), lockAvailable = 
   };
   const console = {
     log: m => logs.log.push(String(m)),
-    warn: m => logs.warn.push(String(m)),
     error: m => logs.error.push(String(m)),
   };
 
-  const sandbox = { Utilities: { formatDate, parseDate }, Calendar: calendar.api, ScriptApp, LockService, console, Date: FakeDate };
+  const Utilities = { formatDate, parseDate, getUuid: randomUUID };
+  const sandbox = { Utilities, Calendar: calendar.api, ScriptApp, LockService, console, Date: FakeDate };
   const bindings = vm.runInNewContext(
-    `${SOURCE}\n;({ CONFIG, HOLD_TITLE, install, uninstall, sync, workRanges, midnightInTz })`,
+    `${SOURCE}\n;({ CONFIG, HOLD_TITLE, HOLD_ID_PREFIX, install, uninstall, sync, workHours })`,
     sandbox,
   );
   return { ...bindings, triggers, logs };
